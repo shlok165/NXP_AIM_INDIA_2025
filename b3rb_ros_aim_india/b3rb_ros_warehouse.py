@@ -13,6 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+############### Manually added ###############
+
 
 import rclpy
 from rclpy.node import Node
@@ -365,21 +367,35 @@ class WarehouseExplore(Node):
 			publisher.publish(message)
 
 	def camera_image_callback(self, message):
-		"""Callback function to handle incoming camera images.
-
-		Args:
-			message: ROS2 message of the type sensor_msgs.msg.CompressedImage.
-
-		Returns:
-			None
-		"""
-		np_arr = np.frombuffer(message.data, np.uint8)
-		image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-		# Process the image from front camera as needed.
-
-		# Optional line for visualizing image on foxglove.
-		# self.publish_debug_image(self.publisher_qr_decode, image)
-
+		"""Process camera images with OpenCV's QR detector"""
+		try:
+			# Convert ROS Image to OpenCV format (your existing code)
+			np_arr = np.frombuffer(message.data, np.uint8)
+			image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+			
+			# Initialize OpenCV QR Code detector
+			qr_detector = cv2.QRCodeDetector()
+			
+			# Detect and decode QR codes
+			decoded_text, points, _ = qr_detector.detectAndDecode(image)
+			
+			if decoded_text:
+				self.get_logger().info(f'Detected QR Code: {decoded_text}')
+				self.qr_code_str = decoded_text
+				
+				# Publish shelf data with QR info (your existing logic)
+				shelf_data = WarehouseShelf()
+				shelf_data.qr_decoded = decoded_text
+				self.publisher_shelf_data.publish(shelf_data)
+			else:
+				self.get_logger().debug('No QR codes detected')
+				
+			# Optional debug publishing
+			self.publish_debug_image(self.publisher_qr_decode, image)
+			
+		except Exception as e:
+			self.get_logger().error(f'Error processing image: {str(e)}')
+			
 	def cerebri_status_callback(self, message):
 		"""Callback function to handle cerebri status updates.
 
