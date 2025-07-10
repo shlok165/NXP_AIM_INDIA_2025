@@ -17,7 +17,7 @@
 import rclpy
 from rclpy.node import Node
 from synapse_msgs.msg import WarehouseShelf
-
+import yaml
 import cv2
 import numpy as np
 
@@ -169,6 +169,65 @@ class ObjectRecognizer(Node):
 	def __init__(self):
 		super().__init__('object_recognizer')
 
+		# Initialize resource paths first
+		resource_name_coco = "../../../../share/ament_index/resource_index/coco.yaml"
+		resource_path_coco = pkg_resources.resource_filename(PACKAGE_NAME, resource_name_coco)
+		resource_name_yolo = "../../../../share/ament_index/resource_index/yolov5n-int8.tflite"
+		resource_path_yolo = pkg_resources.resource_filename(PACKAGE_NAME, resource_name_yolo)
+
+		# Load COCO class names
+		try:
+			with open(resource_path_coco) as f:
+				coco_data = yaml.load(f, Loader=yaml.FullLoader)
+				self.label_names = coco_data['names']
+		except FileNotFoundError:
+			# Fallback to local file if resource not found
+			try:
+				with open('NXP_AIM_INDIA_2025/resource/coco.yaml', 'r') as f:
+					coco_data = yaml.safe_load(f)
+				self.label_names = coco_data['names']
+			except FileNotFoundError:
+				# Use default COCO names if file not found
+				self.label_names = {
+					0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane', 5: 'bus',
+					6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light', 10: 'fire hydrant',
+					11: 'stop sign', 12: 'parking meter', 13: 'bench', 14: 'bird', 15: 'cat',
+					16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow', 20: 'elephant', 21: 'bear',
+					22: 'zebra', 23: 'giraffe', 24: 'backpack', 25: 'umbrella', 26: 'handbag',
+					27: 'tie', 28: 'suitcase', 29: 'frisbee', 30: 'skis', 31: 'snowboard',
+					32: 'sports ball', 33: 'kite', 34: 'baseball bat', 35: 'baseball glove',
+					36: 'skateboard', 37: 'surfboard', 38: 'tennis racket', 39: 'bottle',
+					40: 'wine glass', 41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon',
+					45: 'bowl', 46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange',
+					50: 'broccoli', 51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut',
+					55: 'cake', 56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed',
+					60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse',
+					65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave',
+					69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book',
+					74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear', 78: 'hair drier',
+					79: 'toothbrush'
+				}
+				print("Warning: COCO YAML file not found, using default COCO class names")
+
+		# Initialize TensorFlow Lite interpreter
+		ext_delegate_ops = {}
+		# Uncomment and replace for running on NavQPlus NPU (On-board neural processing unit).
+		# ext_delegate = [tflite.load_delegate("/usr/lib/libvx_delegate.so", ext_delegate_ops)]
+
+		try:
+			# Try to load model from resource path
+			self.interpreter = tflite.Interpreter(model_path=resource_path_yolo)
+		except Exception as e:
+			print(f"Error loading model from resource path: {e}")
+			print("Please ensure the model file exists in the correct location")
+			# You could add a fallback path here if needed
+			raise
+
+		self.interpreter.allocate_tensors()
+
+		self.input_details = self.interpreter.get_input_details()
+		self.output_details = self.interpreter.get_output_details()
+
 		# Subscription for camera images.
 		self.subscription_camera = self.create_subscription(
 			CompressedImage,
@@ -188,38 +247,19 @@ class ObjectRecognizer(Node):
 			"/debug_images/object_recog",
 			QOS_PROFILE_DEFAULT)
 
-		resource_name_coco = "../../../../share/ament_index/resource_index/coco.yaml"
-		resource_path_coco = pkg_resources.resource_filename(PACKAGE_NAME, resource_name_coco)
-		resource_name_yolo = "../../../../share/ament_index/resource_index/yolov5n-int8.tflite"
-		resource_path_yolo = pkg_resources.resource_filename(PACKAGE_NAME, resource_name_yolo)
-
-		with open(resource_path_coco) as f:
-			self.label_names = yaml.load(f, Loader=yaml.FullLoader)['names']
-
-		ext_delegate_ops = {}
-		# Uncomment and replace for running on NavQPlus NPU (On-board neural processing unit).
-		# ext_delegate = [tflite.load_delegate("/usr/lib/libvx_delegate.so", ext_delegate_ops)]
-
-		# self.interpreter = tflite.Interpreter(model_path=resource_path_yolo,
-		# 				      experimental_delegates=ext_delegate)
-		self.interpreter = tflite.Interpreter(model_path=resource_path_yolo)
-
-		self.interpreter.allocate_tensors()
-
-		self.input_details = self.interpreter.get_input_details()
-		self.output_details = self.interpreter.get_output_details()
+		print("Object Recognizer Node initialized successfully!")
 
 
-	""" Publishes images for debugging purposes.
-
-		Args:
-			publisher: ROS2 publisher of the type sensor_msgs.msg.CompressedImage.
-			image: image given by an n-dimensional numpy array.
-
-		Returns:
-			None
-	"""
 	def publish_debug_image(self, publisher, image):
+		""" Publishes images for debugging purposes.
+
+			Args:
+				publisher: ROS2 publisher of the type sensor_msgs.msg.CompressedImage.
+				image: image given by an n-dimensional numpy array.
+
+			Returns:
+				None
+		"""
 		if image.size:
 			message = CompressedImage()
 			_, encoded_data = cv2.imencode('.jpg', image)
@@ -228,44 +268,49 @@ class ObjectRecognizer(Node):
 			publisher.publish(message)
 
 
-	""" Analyzes the image received from /camera/image_raw/compressed to detect shelf objects.
-		Publishes the existence of objects in the image on the /shelf_objects topic.
-
-		Args:
-			message: "docs.ros.org/en/melodic/api/sensor_msgs/html/msg/CompressedImage.html"
-
-		Returns:
-			None
-	"""
 	def camera_image_callback(self, message):
+		""" Analyzes the image received from /camera/image_raw/compressed to detect shelf objects.
+			Publishes the existence of objects in the image on the /shelf_objects topic.
+
+			Args:
+				message: "docs.ros.org/en/melodic/api/sensor_msgs/html/msg/CompressedImage.html"
+
+			Returns:
+				None
+		"""
 		# Convert message to an n-dimensional numpy array representation of image.
 		np_arr = np.frombuffer(message.data, np.uint8)
 		image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 		height, width, _ = image.shape
 
-		# image pre-processing.
+		# Store original image for visualization
+		original_image = image.copy()
+
+		# Image pre-processing.
 		input_size = self.input_details[0]['shape'][1]
-		image = cv2.resize(image, (input_size, input_size))
-		image = image.astype(np.float32)
-		image = cv2.cvtColor(image.astype(np.float32), cv2.COLOR_BGR2RGB)
-		image /= 255
-		img = np.expand_dims(image, axis=0)
+		processed_image = cv2.resize(image, (input_size, input_size))
+		processed_image = processed_image.astype(np.float32)
+		processed_image = cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB)
+		processed_image /= 255.0
+		img = np.expand_dims(processed_image, axis=0)
 
 		shelf_objects_message = WarehouseShelf()
 		object_count_dict = {}
 
-		# invoke for inference.
-		input = self.input_details[0]
-		int8 = input["dtype"] == np.uint8  # is TFLite quantized uint8 model
+		# Invoke for inference.
+		input_tensor = self.input_details[0]
+		int8 = input_tensor["dtype"] == np.uint8  # is TFLite quantized uint8 model
 		if int8:
-			scale, zero_point = input["quantization"]
+			scale, zero_point = input_tensor["quantization"]
 			img = (img / scale + zero_point).astype(np.uint8)  # de-scale
-		self.interpreter.set_tensor(input["index"], img)
+		self.interpreter.set_tensor(input_tensor["index"], img)
 
-		startTime = time.time()
+		start_time = time.time()
 		self.interpreter.invoke()
-		delta = time.time() - startTime
+		delta = time.time() - start_time
 		print("inference time:", '%.1f' % (delta * 1000), "ms")
+
+		# Get output tensors
 		y = []
 		for output in self.output_details:
 			x = self.interpreter.get_tensor(output["index"])
@@ -274,10 +319,7 @@ class ObjectRecognizer(Node):
 				x = (x.astype(np.float32) - zero_point) * scale  # re-scale
 			y.append(x)
 
-		image *= 255
-		image = cv2.cvtColor(image.astype(np.float32), cv2.COLOR_RGB2BGR)
-
-		# processing output.
+		# Processing output.
 		for pred in y:
 			w, h = self.input_details[0]["shape"][1:3]
 			pred[0][..., :4] *= [w, h, w, h]
@@ -290,23 +332,34 @@ class ObjectRecognizer(Node):
 			for i, det in enumerate(pred):
 				if len(det):
 					for *xyxy, conf, cls in reversed(det):
-						start_point = (int(xyxy[0]), int(xyxy[1]))
-						end_point = (int(xyxy[2]), int(xyxy[3]))
+						# Scale coordinates back to original image size
+						x1 = int(xyxy[0] * width / input_size)
+						y1 = int(xyxy[1] * height / input_size)
+						x2 = int(xyxy[2] * width / input_size)
+						y2 = int(xyxy[3] * height / input_size)
 
-						object_name = self.label_names[int(cls)]
+						start_point = (x1, y1)
+						end_point = (x2, y2)
+
+						# Get object name from COCO classes
+						cls_id = int(cls)
+						object_name = self.label_names.get(cls_id, f"unknown_{cls_id}")
 
 						if object_name in object_count_dict:
 							object_count_dict[object_name] += 1
 						else:
 							object_count_dict[object_name] = 1
 
-						cv2.rectangle(image, start_point, end_point, GREEN_COLOR, 2)
-						cv2.putText(image, self.label_names[int(cls)] + " " + str(round(float(conf), 2)),
-							    start_point, cv2.FONT_HERSHEY_SIMPLEX, 1, GREEN_COLOR, 2, cv2.LINE_AA)
+						# Draw on original image
+						cv2.rectangle(original_image, start_point, end_point, GREEN_COLOR, 2)
+						label = f"{object_name} {float(conf):.2f}"
+						cv2.putText(original_image, label, (x1, y1 - 10), 
+								   cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN_COLOR, 2, cv2.LINE_AA)
 
-			image = cv2.resize(image, (width, height))
-			self.publish_debug_image(self.publisher_object_recog, image)
+		# Publish debug image
+		self.publish_debug_image(self.publisher_object_recog, original_image)
 
+		# Populate shelf objects message
 		for key, value in object_count_dict.items():
 			shelf_objects_message.object_name.append(key)
 			shelf_objects_message.object_count.append(value)
@@ -317,15 +370,18 @@ class ObjectRecognizer(Node):
 def main(args=None):
 	rclpy.init(args=args)
 
-	object_recognizer = ObjectRecognizer()
-
-	rclpy.spin(object_recognizer)
-
-	# Destroy the node explicitly
-	# (optional - otherwise it will be done automatically
-	# when the garbage collector destroys the node object)
-	object_recognizer.destroy_node()
-	rclpy.shutdown()
+	try:
+		object_recognizer = ObjectRecognizer()
+		rclpy.spin(object_recognizer)
+	except Exception as e:
+		print(f"Error starting object recognizer: {e}")
+	finally:
+		# Destroy the node explicitly
+		# (optional - otherwise it will be done automatically
+		# when the garbage collector destroys the node object)
+		if 'object_recognizer' in locals():
+			object_recognizer.destroy_node()
+		rclpy.shutdown()
 
 
 if __name__ == '__main__':

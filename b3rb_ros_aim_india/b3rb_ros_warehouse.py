@@ -51,47 +51,92 @@ from scipy.spatial.distance import euclidean
 from sklearn.decomposition import PCA
 
 import tkinter as tk
-from tkinter import ttk
+
 
 QOS_PROFILE_DEFAULT = 10
 SERVER_WAIT_TIMEOUT_SEC = 5.0
 
 PROGRESS_TABLE_GUI = True
 
-
 class WindowProgressTable:
-	def __init__(self, root, shelf_count):
-		self.root = root
-		self.root.title("Shelf Objects & QR Link")
-		self.root.attributes("-topmost", True)
+    def __init__(self, root, shelf_count):
+        self.root = root
+        self.root.title("Shelf Objects & QR Link")
+        self.root.attributes("-topmost", True)
 
-		self.row_count = 2
-		self.col_count = shelf_count
+        # Define headers for the table
+        self.headers = ["Shelf", "Objects Detected", "QR Code"]
+        
+        self.row_count = 2  # Header row + data row
+        self.col_count = shelf_count
 
-		self.boxes = []
-		for row in range(self.row_count):
-			row_boxes = []
-			for col in range(self.col_count):
-				box = tk.Text(root, width=10, height=3, wrap=tk.WORD, borderwidth=1,
-					      relief="solid", font=("Helvetica", 14))
-				box.insert(tk.END, "NULL")
-				box.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
-				row_boxes.append(box)
-			self.boxes.append(row_boxes)
+        self.boxes = []
+        
+        # Create header row
+        header_labels = ["Shelf", "Objects", "QR Code"]
+        for col in range(len(header_labels)):
+            box = tk.Text(root, width=15, height=1, wrap=tk.WORD, borderwidth=2,
+                          relief="solid", font=("Helvetica", 14, "bold"))
+            box.insert(tk.END, header_labels[col])
+            box.grid(row=0, column=col, padx=3, pady=3, sticky="nsew")
+            box.config(state="disabled")  # Make header read-only
+            self.boxes.append([box])
+        
+        # Create data rows
+        for row in range(1, self.row_count):
+            row_boxes = []
+            for col in range(len(header_labels)):
+                box = tk.Text(root, width=15, height=3, wrap=tk.WORD, borderwidth=1,
+                              relief="solid", font=("Helvetica", 12))
+                if col == 0:
+                    box.insert(tk.END, f"Shelf {row}")
+                else:
+                    box.insert(tk.END, "Waiting...")
+                box.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
+                row_boxes.append(box)
+            self.boxes.append(row_boxes)
 
-		# Make the grid layout responsive.
-		for row in range(self.row_count):
-			self.root.grid_rowconfigure(row, weight=1)
-		for col in range(self.col_count):
-			self.root.grid_columnconfigure(col, weight=1)
+        # Make the grid layout responsive
+        for row in range(self.row_count):
+            self.root.grid_rowconfigure(row, weight=1)
+        for col in range(len(header_labels)):
+            self.root.grid_columnconfigure(col, weight=1)
+            
+        # Store the latest detection results
+        self.shelf_data = {}
 
-	def change_box_color(self, row, col, color):
-		self.boxes[row][col].config(bg=color)
+    def update_shelf_data(self, shelf_msg, shelf_index=0):
+        """Update the table with new shelf data"""
+        if not hasattr(shelf_msg, 'object_name') or not hasattr(shelf_msg, 'object_count'):
+            return
+            
+        # Format the detected objects
+        detected_objects = []
+        for name, count in zip(shelf_msg.object_name, shelf_msg.object_count):
+            if count > 1:
+                detected_objects.append(f"{name} x{count}")
+            else:
+                detected_objects.append(name)
+        
+        display_text = "\n".join(detected_objects) if detected_objects else "No objects"
+        
+        # Update objects column
+        self.change_box_text(1, 1, display_text)
+        self.change_box_color(1, 1, "lightgreen" if detected_objects else "white")
+        
+        # Update QR code column if available
+        if hasattr(shelf_msg, 'qr_code'):
+            self.change_box_text(1, 2, shelf_msg.qr_code)
+            self.change_box_color(1, 2, "lightblue")
 
-	def change_box_text(self, row, col, text):
-		self.boxes[row][col].delete(1.0, tk.END)
-		self.boxes[row][col].insert(tk.END, text)
+    def change_box_color(self, row, col, color):
+        """Change the background color of a specific cell"""
+        self.boxes[row][col].config(bg=color)
 
+    def change_box_text(self, row, col, text):
+        """Change the text of a specific cell"""
+        self.boxes[row][col].delete(1.0, tk.END)
+        self.boxes[row][col].insert(tk.END, text)
 box_app = None
 def run_gui(shelf_count):
 	global box_app
@@ -108,6 +153,13 @@ class WarehouseExplore(Node):
 	"""
 	def __init__(self):
 		super().__init__('warehouse_explore')
+
+		self.declare_parameter('shelf_count', 1)
+		self.shelf_count = self.get_parameter('shelf_count').get_parameter_value().integer_value
+
+		if PROGRESS_TABLE_GUI:
+			self.root = tk.Tk()
+			self.progress_table = WindowProgressTable(self.root, self.shelf_count)
 
 		self.action_client = ActionClient(
 			self,
@@ -173,7 +225,6 @@ class WarehouseExplore(Node):
 			"/shelf_data",
 			QOS_PROFILE_DEFAULT)
 
-		self.declare_parameter('shelf_count', 1)
 		self.declare_parameter('initial_angle', 0.0)
 
 		self.shelf_count = \
@@ -368,6 +419,10 @@ class WarehouseExplore(Node):
 
 	def camera_image_callback(self, message):
 		"""Process camera images with OpenCV's QR detector"""
+		if PROGRESS_TABLE_GUI:
+			self.root.update_idletasks()
+			self.root.update()
+        
 		try:
 			# Convert ROS Image to OpenCV format (your existing code)
 			np_arr = np.frombuffer(message.data, np.uint8)
@@ -431,52 +486,16 @@ class WarehouseExplore(Node):
 				# self.goal_handle_curr = None
 				pass
 
-	def shelf_objects_callback(self, message):
-		"""Callback function to handle shelf objects updates.
+	def shelf_objects_callback(self, msg):
+		try:
+			self.shelf_objects_curr = msg
+			self.get_logger().info(f"Recieved shelf object: {msg.object_name}")
 
-		Args:
-			message: ROS2 message containing shelf objects data.
-
-		Returns:
-			None
-		"""
-		self.shelf_objects_curr = message
-		# Process the shelf objects as needed.
-
-		# How to send WarehouseShelf messages for evaluation.
-		"""
-		* Example for sending WarehouseShelf messages for evaluation.
-			shelf_data_message = WarehouseShelf()
-
-			shelf_data_message.object_name = ["car", "clock"]
-			shelf_data_message.object_count = [1, 2]
-			shelf_data_message.qr_decoded = "test qr string"
-
-			self.publisher_shelf_data.publish(shelf_data_message)
-
-		* Alternatively, you may store the QR for current shelf as self.qr_code_str.
-			Then, add it as self.shelf_objects_curr.qr_decoded = self.qr_code_str
-			Then, publish as self.publisher_shelf_data.publish(self.shelf_objects_curr)
-			This, will publish the current detected objects with the last QR decoded.
-		"""
-
-		# Optional code for populating TABLE GUI with detected objects and QR data.
-		"""
-		if PROGRESS_TABLE_GUI:
-			shelf = self.shelf_objects_curr
-			obj_str = ""
-			for name, count in zip(shelf.object_name, shelf.object_count):
-				obj_str += f"{name}: {count}\n"
-
-			box_app.change_box_text(self.table_row_count, self.table_col_count, obj_str)
-			box_app.change_box_color(self.table_row_count, self.table_col_count, "cyan")
-			self.table_row_count += 1
-
-			box_app.change_box_text(self.table_row_count, self.table_col_count, self.qr_code_str)
-			box_app.change_box_color(self.table_row_count, self.table_col_count, "yellow")
-			self.table_row_count = 0
-			self.table_col_count += 1
-		"""
+			if PROGRESS_TABLE_GUI:
+				self.progress_table.update_shelf_data(msg)
+				self.root.update_idletasks()
+		except Exception as e:
+			self.get_logger().error(f"Error processing shelf objects: {e}")
 
 	def rover_move_manual_mode(self, speed, turn):
 		"""Operates the rover in manual mode by publishing on /cerebri/in/joy.
@@ -709,17 +728,16 @@ def main(args=None):
 	warehouse_explore = WarehouseExplore()
 
 	if PROGRESS_TABLE_GUI:
-		gui_thread = threading.Thread(target=run_gui, args=(warehouse_explore.shelf_count,))
+		gui_thread = threading.Thread(target=warehouse_explore.root.mainloop, daemon=True)
 		gui_thread.start()
-
-	rclpy.spin(warehouse_explore)
-
-	# Destroy the node explicitly
-	# (optional - otherwise it will be done automatically
-	# when the garbage collector destroys the node object)
-	warehouse_explore.destroy_node()
-	rclpy.shutdown()
-
+	
+	try:
+		rclpy.spin(warehouse_explore)
+	except Exception as e:
+		warehouse_explore.get_logger().error(f"Exception occurred: {e}")
+	finally:
+		warehouse_explore.destroy_node()
+		rclpy.shutdown()
 
 if __name__ == '__main__':
 	main()
