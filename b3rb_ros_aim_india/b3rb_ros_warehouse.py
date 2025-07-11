@@ -18,12 +18,11 @@
 
 import rclpy
 from rclpy.node import Node
-from rclpy.timer import Timer
 from rclpy.action import ActionClient
-from rclpy.parameter import Parameter
+
 
 import math
-import time
+
 import numpy as np
 import cv2
 from typing import Optional, Tuple
@@ -31,7 +30,7 @@ import asyncio
 import threading
 
 from sensor_msgs.msg import Joy
-from sensor_msgs.msg import LaserScan
+
 from sensor_msgs.msg import CompressedImage
 
 from geometry_msgs.msg import Quaternion
@@ -46,9 +45,8 @@ from action_msgs.msg import GoalStatus
 from synapse_msgs.msg import Status
 from synapse_msgs.msg import WarehouseShelf
 
-from scipy.ndimage import label, center_of_mass
 from scipy.spatial.distance import euclidean
-from sklearn.decomposition import PCA
+
 
 import tkinter as tk
 
@@ -67,76 +65,200 @@ class WindowProgressTable:
         # Define headers for the table
         self.headers = ["Shelf", "Objects Detected", "QR Code"]
         
-        self.row_count = 2  # Header row + data row
-        self.col_count = shelf_count
-
-        self.boxes = []
+        # Store shelf data
+        self.shelf_count = shelf_count
+        self.current_shelf_index = 0  # Start with shelf 1
+        self.shelf_objects = {}  # {shelf_index: {object_name: count}}
+        self.shelf_qr_codes = {}  # {shelf_index: qr_code}
+        self.all_qr_codes = set()  # Track all unique QR codes
         
+        # Create GUI elements
+        self.boxes = []
+        self.create_table()
+        
+        # Debug message to confirm setup
+        print(f"GUI initialized with {shelf_count} shelves. Current active shelf: 1")
+
+    def create_table(self):
+        """Create the table layout"""
         # Create header row
-        header_labels = ["Shelf", "Objects", "QR Code"]
-        for col in range(len(header_labels)):
-            box = tk.Text(root, width=15, height=1, wrap=tk.WORD, borderwidth=2,
-                          relief="solid", font=("Helvetica", 14, "bold"))
-            box.insert(tk.END, header_labels[col])
+        header_row = []
+        for col, header in enumerate(self.headers):
+            box = tk.Text(self.root, width=15, height=1, wrap=tk.WORD, borderwidth=2,
+                         relief="solid", font=("Helvetica", 14, "bold"))
+            box.insert(tk.END, header)
             box.grid(row=0, column=col, padx=3, pady=3, sticky="nsew")
             box.config(state="disabled")  # Make header read-only
-            self.boxes.append([box])
+            header_row.append(box)
+        self.boxes.append(header_row)
         
-        # Create data rows
-        for row in range(1, self.row_count):
+        # Create data rows (one for each shelf)
+        for row in range(1, self.shelf_count + 1):
             row_boxes = []
-            for col in range(len(header_labels)):
-                box = tk.Text(root, width=15, height=3, wrap=tk.WORD, borderwidth=1,
-                              relief="solid", font=("Helvetica", 12))
-                if col == 0:
+            for col in range(len(self.headers)):
+                box = tk.Text(self.root, width=15, height=3, wrap=tk.WORD, borderwidth=1,
+                             relief="solid", font=("Helvetica", 12))
+                
+                if col == 0:  # Shelf column
                     box.insert(tk.END, f"Shelf {row}")
-                else:
-                    box.insert(tk.END, "Waiting...")
+                    box.config(state="disabled")
+                else:  # Objects and QR columns
+                    if row == 1:  # Only first shelf is active initially
+                        box.insert(tk.END, "Waiting for data...")
+                        box.config(bg="lightyellow")  # Active shelf has yellow background
+                    else:  # Other shelves are locked
+                        box.insert(tk.END, "Locked")
+                        box.config(bg="lightgray")  # Locked shelves have gray background
+                
                 box.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
                 row_boxes.append(box)
             self.boxes.append(row_boxes)
 
         # Make the grid layout responsive
-        for row in range(self.row_count):
+        for row in range(self.shelf_count + 1):  # +1 for header
             self.root.grid_rowconfigure(row, weight=1)
-        for col in range(len(header_labels)):
+        for col in range(len(self.headers)):
             self.root.grid_columnconfigure(col, weight=1)
-            
-        # Store the latest detection results
-        self.shelf_data = {}
 
-    def update_shelf_data(self, shelf_msg, shelf_index=0):
-        """Update the table with new shelf data"""
-        if not hasattr(shelf_msg, 'object_name') or not hasattr(shelf_msg, 'object_count'):
-            return
+    def update_shelf_data(self, shelf_msg, shelf_index=None):
+        """Update table with new shelf data - handles both objects and QR codes"""
+        try:
+            # If QR code is provided, process it
+            if hasattr(shelf_msg, 'qr_decoded') and shelf_msg.qr_decoded:
+                qr_code = shelf_msg.qr_decoded.strip()
+                if qr_code:
+                    self.process_qr_code(qr_code)
+                    return  # QR code processing is complete
             
-        # Format the detected objects
-        detected_objects = []
-        for name, count in zip(shelf_msg.object_name, shelf_msg.object_count):
-            if count > 1:
-                detected_objects.append(f"{name} x{count}")
+            # Process objects for current shelf
+            if hasattr(shelf_msg, 'object_name') and hasattr(shelf_msg, 'object_count'):
+                self.update_shelf_objects(shelf_msg.object_name, shelf_msg.object_count)
+                
+        except Exception as e:
+            print(f"Error updating shelf data: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def update_shelf_objects(self, object_names, object_counts):
+        """Update objects for the current active shelf"""
+        try:
+            # Initialize shelf objects dictionary if not exists
+            if self.current_shelf_index not in self.shelf_objects:
+                self.shelf_objects[self.current_shelf_index] = {}
+            
+            # Process detected objects
+            for name, count in zip(object_names, object_counts):
+                if name and count > 0:
+                    # Update count (keep maximum value seen)
+                    if name in self.shelf_objects[self.current_shelf_index]:
+                        self.shelf_objects[self.current_shelf_index][name] = max(
+                            self.shelf_objects[self.current_shelf_index][name], count
+                        )
+                    else:
+                        self.shelf_objects[self.current_shelf_index][name] = count
+            
+            # Update the display
+            self.update_objects_display(self.current_shelf_index)
+            print(f"Updated objects for Shelf {self.current_shelf_index + 1}")
+            
+        except Exception as e:
+            print(f"Error updating shelf objects: {e}")
+    
+    def process_qr_code(self, qr_code):
+        """Process a QR code - add to current shelf and advance if unique"""
+        try:
+            # Check if QR is unique
+            if qr_code in self.all_qr_codes:
+                print(f"QR code '{qr_code}' already exists, ignoring duplicate")
+                return False
+            
+            # Add QR to current shelf
+            self.shelf_qr_codes[self.current_shelf_index] = qr_code
+            self.all_qr_codes.add(qr_code)
+            
+            # Update QR display for current shelf
+            self.update_qr_display(self.current_shelf_index)
+            print(f"Added QR code '{qr_code}' to Shelf {self.current_shelf_index + 1}")
+            
+            # Advance to next shelf if possible
+            if self.current_shelf_index < self.shelf_count - 1:
+                self.current_shelf_index += 1
+                self.unlock_shelf(self.current_shelf_index)
+                print(f"Advanced to Shelf {self.current_shelf_index + 1}")
+                return True
             else:
-                detected_objects.append(name)
-        
-        display_text = "\n".join(detected_objects) if detected_objects else "No objects"
-        
-        # Update objects column
-        self.change_box_text(1, 1, display_text)
-        self.change_box_color(1, 1, "lightgreen" if detected_objects else "white")
-        
-        # Update QR code column if available
-        if hasattr(shelf_msg, 'qr_code'):
-            self.change_box_text(1, 2, shelf_msg.qr_code)
-            self.change_box_color(1, 2, "lightblue")
+                print("All shelves completed!")
+                return False
+                
+        except Exception as e:
+            print(f"Error processing QR code: {e}")
+            return False
+    
+    def unlock_shelf(self, shelf_index):
+        """Unlock a shelf in the GUI"""
+        try:
+            # Activate objects column
+            self.boxes[shelf_index + 1][1].config(state="normal")
+            self.boxes[shelf_index + 1][1].delete(1.0, tk.END)
+            self.boxes[shelf_index + 1][1].insert(tk.END, "Waiting for data...")
+            self.boxes[shelf_index + 1][1].config(bg="lightyellow")
+            
+            # Activate QR column
+            self.boxes[shelf_index + 1][2].config(state="normal")
+            self.boxes[shelf_index + 1][2].delete(1.0, tk.END)
+            self.boxes[shelf_index + 1][2].insert(tk.END, "Scan QR code...")
+            self.boxes[shelf_index + 1][2].config(bg="lightyellow")
+            
+        except Exception as e:
+            print(f"Error unlocking shelf: {e}")
+    
+    def update_objects_display(self, shelf_index):
+        """Update the objects display for a specific shelf"""
+        try:
+            # Format object data
+            if shelf_index in self.shelf_objects and self.shelf_objects[shelf_index]:
+                object_list = []
+                for obj_name, count in self.shelf_objects[shelf_index].items():
+                    if count > 1:
+                        object_list.append(f"{obj_name} x{count}")
+                    else:
+                        object_list.append(obj_name)
+                display_text = "\n".join(object_list)
+            else:
+                display_text = "No objects detected"
+            
+            # Update cell
+            self.boxes[shelf_index + 1][1].config(state="normal")
+            self.boxes[shelf_index + 1][1].delete(1.0, tk.END)
+            self.boxes[shelf_index + 1][1].insert(tk.END, display_text)
+            
+            # Change background color based on content
+            if display_text != "No objects detected" and display_text != "Waiting for data...":
+                self.boxes[shelf_index + 1][1].config(bg="lightgreen")
+            
+            self.boxes[shelf_index + 1][1].config(state="normal")  # Keep editable for updates
+            
+        except Exception as e:
+            print(f"Error updating objects display: {e}")
+    
+    def update_qr_display(self, shelf_index):
+        """Update the QR code display for a specific shelf"""
+        try:
+            # Get QR code for this shelf
+            qr_text = self.shelf_qr_codes.get(shelf_index, "")
+            
+            # Update cell
+            self.boxes[shelf_index + 1][2].config(state="normal")
+            self.boxes[shelf_index + 1][2].delete(1.0, tk.END)
+            self.boxes[shelf_index + 1][2].insert(tk.END, qr_text)
+            
+            # Change background color to indicate QR is scanned
+            self.boxes[shelf_index + 1][2].config(bg="lightblue")
+            self.boxes[shelf_index + 1][2].config(state="normal")  # Keep editable for updates
+            
+        except Exception as e:
+            print(f"Error updating QR display: {e}")
 
-    def change_box_color(self, row, col, color):
-        """Change the background color of a specific cell"""
-        self.boxes[row][col].config(bg=color)
-
-    def change_box_text(self, row, col, text):
-        """Change the text of a specific cell"""
-        self.boxes[row][col].delete(1.0, tk.END)
-        self.boxes[row][col].insert(tk.END, text)
 box_app = None
 def run_gui(shelf_count):
 	global box_app
@@ -422,9 +544,9 @@ class WarehouseExplore(Node):
 		if PROGRESS_TABLE_GUI:
 			self.root.update_idletasks()
 			self.root.update()
-        
+		
 		try:
-			# Convert ROS Image to OpenCV format (your existing code)
+			# Convert ROS Image to OpenCV format
 			np_arr = np.frombuffer(message.data, np.uint8)
 			image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 			
@@ -434,23 +556,42 @@ class WarehouseExplore(Node):
 			# Detect and decode QR codes
 			decoded_text, points, _ = qr_detector.detectAndDecode(image)
 			
-			if decoded_text:
+			if decoded_text and decoded_text != self.qr_code_str:
 				self.get_logger().info(f'Detected QR Code: {decoded_text}')
 				self.qr_code_str = decoded_text
 				
-				# Publish shelf data with QR info (your existing logic)
+				# Create shelf data message with QR info
 				shelf_data = WarehouseShelf()
 				shelf_data.qr_decoded = decoded_text
-				self.publisher_shelf_data.publish(shelf_data)
-			else:
-				self.get_logger().debug('No QR codes detected')
 				
-			# Optional debug publishing
-			self.publish_debug_image(self.publisher_qr_decode, image)
+				# Update GUI with QR code
+				if PROGRESS_TABLE_GUI:
+					self.progress_table.update_shelf_data(shelf_data)
+					self.root.update_idletasks()
+				
+				# Publish for other nodes
+				self.publisher_shelf_data.publish(shelf_data)
 			
+			# Add bounding box for detected QR code
+			if points is not None and len(points) > 0:
+				# Draw QR code boundary
+				debug_image = image.copy()
+				cv2.polylines(debug_image, [np.int32(points)], True, (0, 255, 0), 3)
+				
+				# Add text label
+				if decoded_text:
+					cv2.putText(debug_image, decoded_text, (int(points[0][0][0]), int(points[0][0][1])-10), 
+							   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+				
+				# Publish debug image
+				self.publish_debug_image(self.publisher_qr_decode, debug_image)
+			else:
+				# Publish original image if no QR detected
+				self.publish_debug_image(self.publisher_qr_decode, image)
+				
 		except Exception as e:
 			self.get_logger().error(f'Error processing image: {str(e)}')
-			
+
 	def cerebri_status_callback(self, message):
 		"""Callback function to handle cerebri status updates.
 
@@ -489,9 +630,10 @@ class WarehouseExplore(Node):
 	def shelf_objects_callback(self, msg):
 		try:
 			self.shelf_objects_curr = msg
-			self.get_logger().info(f"Recieved shelf object: {msg.object_name}")
+			self.get_logger().info(f"Received shelf objects: {msg.object_name}")
 
 			if PROGRESS_TABLE_GUI:
+				# Update objects for current shelf only
 				self.progress_table.update_shelf_data(msg)
 				self.root.update_idletasks()
 		except Exception as e:
