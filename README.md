@@ -307,7 +307,7 @@ cd B3RB_YOLO_OBJECT_RECOG
 git checkout nxp_aim_india_2025
 
 mv resource/coco.yaml ~/cognipilot/cranium/src/NXP_AIM_INDIA_2025/resource/
-mv resource/yolov5n-int8.tflite ~/cognipilot/cranium/src/NXP_AIM_INDIA_2025/resource/
+mv resource/yolo11n_float16.tflite ~/cognipilot/cranium/src/NXP_AIM_INDIA_2025/resource/
 mv b3rb_ros_aim_india/b3rb_ros_object_recog.py ~/cognipilot/cranium/src/NXP_AIM_INDIA_2025/b3rb_ros_aim_india/
 
 cd ..

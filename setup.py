@@ -10,7 +10,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/ament_index/resource_index', ['resource/coco.yaml']),
-        ('share/ament_index/resource_index', ['resource/yolov5n-int8.tflite']),
+        ('share/ament_index/resource_index', ['resource/yolov5n_float16.tflite']),
         ('share/' + package_name, ['package.xml']),
     ],
     install_requires=['setuptools'],
