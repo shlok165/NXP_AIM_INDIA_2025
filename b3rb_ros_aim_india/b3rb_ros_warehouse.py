@@ -15,7 +15,7 @@
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+
 import numpy as np
 import cv2
 import tkinter as tk
@@ -238,7 +238,7 @@ class WarehouseExplore(Node):
             CompressedImage,
             '/camera/image_raw/compressed',
             self.camera_image_callback,
-            qos_profile_sensor_data)
+            QOS_PROFILE_DEFAULT)
 
         # Publishers
         self.publisher_joy = self.create_publisher(
@@ -249,7 +249,7 @@ class WarehouseExplore(Node):
         self.publisher_qr_decode = self.create_publisher(
             CompressedImage,
             "/debug_images/qr_code",
-            qos_profile_sensor_data)
+            QOS_PROFILE_DEFAULT)
 
         self.publisher_shelf_data = self.create_publisher(
             WarehouseShelf,
@@ -259,7 +259,7 @@ class WarehouseExplore(Node):
         self.publisher_shelf_debug = self.create_publisher(
             CompressedImage,
             "/debug_images/shelf_detection",
-            qos_profile_sensor_data)
+            QOS_PROFILE_DEFAULT)
 
         # Robot state
         self.armed = False
