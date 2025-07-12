@@ -244,7 +244,7 @@ class WarehouseExplore(Node):
 
         # Alignment control variables
         self.alignment_active = True
-        self.alignment_tolerance = 0.087  # radians (~5 degrees) - increased tolerance
+        self.alignment_tolerance = 0.01  # radians (~5 degrees) - increased tolerance
         self.angular_velocity_gain = 0.1  # Increased gain
         self.max_angular_velocity = 0.75   # Increased max velocity
         self.min_angular_velocity = 0.5  # Increased minimum velocity
@@ -365,24 +365,39 @@ class WarehouseExplore(Node):
         self.navigate_to_pose(target_x, target_y, self.target_angle_rad)
 
     def euler_to_quaternion(self, yaw):
-        """Convert yaw angle to quaternion"""
+        """Convert yaw angle to quaternion with normalization"""
+        # Normalize the yaw angle first
+        yaw = self.normalize_angle(yaw)
+        
         from geometry_msgs.msg import Quaternion
         quat = Quaternion()
         quat.x = 0.0
         quat.y = 0.0
         quat.z = math.sin(yaw / 2.0)
         quat.w = math.cos(yaw / 2.0)
+        
+        # Ensure quaternion is normalized (should already be, but just to be safe)
+        length = math.sqrt(quat.x**2 + quat.y**2 + quat.z**2 + quat.w**2)
+        if abs(length - 1.0) > 0.01 and length > 0:  # Only normalize if needed
+            quat.x /= length
+            quat.y /= length
+            quat.z /= length
+            quat.w /= length
+        
         return quat
 
     def navigate_to_pose(self, x, y, yaw):
-        """Navigate to a specific pose using Nav2"""
+        """Navigate to a specific pose using Nav2 with improved angle handling"""
         if not self.armed:
             self.get_logger().warn("Robot not armed - cannot navigate")
             return False
             
-        if not self.nav_action_client.wait_for_server(timeout_sec=5.0):
+        if not self.nav_action_client.wait_for_server(timeout_sec=1.0):
             self.get_logger().error("Nav2 server not available!")
             return False
+
+        # Normalize the target yaw angle
+        yaw = self.normalize_angle(yaw)
 
         # Create goal message
         goal_msg = NavigateToPose.Goal()
@@ -390,24 +405,33 @@ class WarehouseExplore(Node):
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
         
         # Set position
-        goal_msg.pose.pose.position.x = x
-        goal_msg.pose.pose.position.y = y
+        goal_msg.pose.pose.position.x = float(x)  # Ensure values are floats
+        goal_msg.pose.pose.position.y = float(y)
         goal_msg.pose.pose.position.z = 0.0
         
-        # Set orientation
+        # Set orientation with proper normalization
         goal_msg.pose.pose.orientation = self.euler_to_quaternion(yaw)
         
-        self.get_logger().info(f"Navigating to: x={x:.3f}, y={y:.3f}, yaw={math.degrees(yaw):.1f}°")
-        
-        # Send goal
-        self.navigation_goal_handle = self.nav_action_client.send_goal_async(
-            goal_msg,
-            feedback_callback=self.navigation_feedback_callback
+        self.get_logger().info(
+            f"Navigating to: x={x:.3f}, y={y:.3f}, yaw={math.degrees(yaw):.1f}° "
+            f"quat=({goal_msg.pose.pose.orientation.w:.2f}, {goal_msg.pose.pose.orientation.x:.2f}, "
+            f"{goal_msg.pose.pose.orientation.y:.2f}, {goal_msg.pose.pose.orientation.z:.2f})"
         )
-        self.navigation_goal_handle.add_done_callback(self.navigation_goal_response_callback)
         
-        self.navigation_active = True
-        return True
+        try:
+            # Send goal
+            self.navigation_goal_handle = self.nav_action_client.send_goal_async(
+                goal_msg,
+                feedback_callback=self.navigation_feedback_callback
+            )
+            self.navigation_goal_handle.add_done_callback(self.navigation_goal_response_callback)
+            
+            self.navigation_active = True
+            return True
+        except Exception as e:
+            self.get_logger().error(f"Error sending navigation goal: {e}")
+            self.navigation_active = False
+            return False
 
     def navigation_goal_response_callback(self, future):
         """Handle navigation goal response"""
@@ -424,11 +448,37 @@ class WarehouseExplore(Node):
         result_future.add_done_callback(self.navigation_result_callback)
 
     def navigation_feedback_callback(self, feedback_msg):
-        """Handle navigation feedback"""
-        feedback = feedback_msg.feedback
-        distance_remaining = feedback.distance_remaining
-        
-        self.get_logger().info(f"Navigation feedback: {distance_remaining:.2f}m remaining")
+        """Handle navigation feedback with rate limiting"""
+        try:
+            feedback = feedback_msg.feedback
+            current_time = self.get_clock().now()
+            
+            # Rate limit feedback logging to avoid flooding
+            if not hasattr(self, 'last_feedback_time') or \
+               (current_time - self.last_feedback_time).nanoseconds > 500_000_000:  # 0.5 seconds
+                self.last_feedback_time = current_time
+                
+                # Extract useful information from feedback
+                distance_remaining = feedback.distance_remaining
+                
+                # Get current pose from feedback
+                current_pose = feedback.current_pose.pose
+                current_x = current_pose.position.x
+                current_y = current_pose.position.y
+                
+                # Extract orientation as yaw angle
+                orientation = current_pose.orientation
+                current_yaw = self.quaternion_to_euler(
+                    orientation.x, orientation.y, orientation.z, orientation.w
+                )
+                
+                self.get_logger().info(
+                    f"Navigation progress: pos=({current_x:.2f}, {current_y:.2f}), "
+                    f"yaw={math.degrees(current_yaw):.1f}°, "
+                    f"remaining={distance_remaining:.2f}m"
+                )
+        except Exception as e:
+            self.get_logger().error(f"Error in navigation feedback: {e}")
 
     def navigation_result_callback(self, future):
         """Handle navigation result"""
@@ -442,18 +492,28 @@ class WarehouseExplore(Node):
         self.navigation_active = False
 
     def quaternion_to_euler(self, x, y, z, w):
-        """Convert quaternion to euler angles (yaw)"""
-        siny_cosp = 2 * (w * z + x * y)
-        cosy_cosp = 1 - 2 * (y * y + z * z)
+        """Convert quaternion to euler angles (yaw) with improved robustness"""
+        # Check for degenerate cases
+        if abs(x*x + y*y + z*z + w*w - 1.0) > 0.01:
+            # Not normalized, attempt to normalize
+            norm = math.sqrt(x*x + y*y + z*z + w*w)
+            if norm > 0:
+                x /= norm
+                y /= norm
+                z /= norm
+                w /= norm
+        
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
         yaw = math.atan2(siny_cosp, cosy_cosp)
-        return yaw
+        return self.normalize_angle(yaw)
 
     def normalize_angle(self, angle):
         """Normalize angle to [-pi, pi]"""
         while angle > math.pi:
-            angle -= 2 * math.pi
+            angle -= 2.0 * math.pi
         while angle < -math.pi:
-            angle += 2 * math.pi
+            angle += 2.0 * math.pi
         return angle
 
     def pose_callback(self, message):
@@ -461,17 +521,36 @@ class WarehouseExplore(Node):
         self.buggy_pose_x = message.pose.pose.position.x
         self.buggy_pose_y = message.pose.pose.position.y
         
+        # Extract current yaw from quaternion
+        orientation = message.pose.pose.orientation
+        self.current_yaw = self.quaternion_to_euler(
+            orientation.x, orientation.y, orientation.z, orientation.w
+        )
+        
         # Store initial position when first pose is received
         if not self.initial_position_set:
             self.initial_x = self.buggy_pose_x
             self.initial_y = self.buggy_pose_y
+            self.initial_yaw = self.current_yaw
             self.initial_position_set = True
-            self.get_logger().info(f"Initial position set: x={self.initial_x:.3f}, y={self.initial_y:.3f}")
+            self.get_logger().info(f"Initial position set: x={self.initial_x:.3f}, y={self.initial_y:.3f}, yaw={math.degrees(self.initial_yaw):.1f}°")
 
     def navigate_to_initial_orientation(self):
         """Navigate to the initial position but with the target orientation"""
-        if self.armed and self.initial_position_set:
-            self.navigate_to_pose(self.initial_x, self.initial_y, self.target_angle_rad)
+        if self.armed and self.initial_position_set and not self.navigation_active:
+            # Normalize target angle
+            target_yaw = self.normalize_angle(self.target_angle_rad)
+            
+            self.get_logger().info(f"Navigating to initial position with target orientation: {math.degrees(target_yaw):.1f}°")
+            return self.navigate_to_pose(self.initial_x, self.initial_y, target_yaw)
+        else:
+            if not self.armed:
+                self.get_logger().warn("Cannot navigate - robot not armed")
+            elif not self.initial_position_set:
+                self.get_logger().warn("Cannot navigate - initial position not set")
+            elif self.navigation_active:
+                self.get_logger().warn("Cannot navigate - navigation already active")
+            return False
 
     def perform_alignment(self):
         """Align the robot to the target angle"""
