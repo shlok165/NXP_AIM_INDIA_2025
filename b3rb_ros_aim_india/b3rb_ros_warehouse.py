@@ -37,7 +37,11 @@ class WindowProgressTable:
         self.root = root
         self.root.title("Shelf Objects & QR Link")
         self.root.attributes("-topmost", True)
-
+        
+        # Make the window a fixed size
+        self.root.geometry("600x400")
+        self.root.resizable(False, False)
+        
         self.headers = ["Shelf", "Objects Detected", "QR Code"]
         self.shelf_count = shelf_count
         self.current_shelf_index = 0
@@ -223,18 +227,11 @@ class WarehouseExplore(Node):
         
         self.get_logger().info(f"Target alignment angle: {self.target_angle_deg}° ({self.target_angle_rad:.3f} rad)")
 
-        # Fix GUI threading issues with try-except
+        # Replace the GUI initialization with thread-safe version
         if PROGRESS_TABLE_GUI:
-            try:
-                self.root = tk.Tk()
-                self.root.protocol("WM_DELETE_WINDOW", self.on_closing)  # Handle window closing
-                self.progress_table = WindowProgressTable(self.root, self.shelf_count)
-                self.gui_thread = Thread(target=self.gui_mainloop, daemon=True)
-                self.gui_thread.start()
-                self.get_logger().info("GUI initialized successfully")
-            except Exception as e:
-                self.get_logger().error(f"Failed to initialize GUI: {e}")
-                self.root = None
+            self.gui_initialized = False
+            self.gui_queue = []
+            self.init_gui()
         
         # Add timer to check Nav2 availability
         self.create_timer(5.0, self.check_nav2_status)
@@ -250,12 +247,6 @@ class WarehouseExplore(Node):
         self.min_angular_velocity = 0.5  # Increased minimum velocity
         
         self.get_logger().info(f"Target alignment angle: {self.target_angle_deg}° ({self.target_angle_rad:.3f} rad)")
-
-        if PROGRESS_TABLE_GUI:
-            self.root = tk.Tk()
-            self.progress_table = WindowProgressTable(self.root, self.shelf_count)
-            self.gui_thread = Thread(target=self.root.mainloop, daemon=True)
-            self.gui_thread.start()
 
         # Shelf detection parameters
         self.shelf_detection_enabled = True
@@ -326,6 +317,33 @@ class WarehouseExplore(Node):
         self.current_yaw = 0.0
         self.last_yaw = 0.0
         self.alignment_start_time = None
+
+    def init_gui(self):
+        """Initialize GUI in a separate thread"""
+        def gui_thread_func():
+            self.root = tk.Tk()
+            self.progress_table = WindowProgressTable(self.root, self.shelf_count)
+            self.gui_initialized = True
+            
+            # Process any queued updates
+            while self.gui_queue:
+                func, args = self.gui_queue.pop(0)
+                func(*args)
+                
+            self.root.mainloop()
+            
+        self.gui_thread = Thread(target=gui_thread_func, daemon=True)
+        self.gui_thread.start()
+    
+    def safe_gui_update(self, func, *args):
+        """Thread-safe GUI update method"""
+        if not PROGRESS_TABLE_GUI:
+            return
+            
+        if hasattr(self, 'gui_initialized') and self.gui_initialized:
+            self.root.after(0, func, *args)
+        else:
+            self.gui_queue.append((func, args))
 
     def gui_mainloop(self):
         """Run GUI mainloop with error handling"""
@@ -609,8 +627,6 @@ class WarehouseExplore(Node):
         self.publisher_cmd_vel.publish(twist)
 
     def camera_image_callback(self, message):
-        # Remove GUI updates from callback to prevent threading issues
-        
         try:
             np_arr = np.frombuffer(message.data, np.uint8)
             image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -626,87 +642,15 @@ class WarehouseExplore(Node):
                 shelf_data = WarehouseShelf()
                 shelf_data.qr_decoded = decoded_text
                 
-                if PROGRESS_TABLE_GUI:
-                    # Use thread-safe method to update GUI
-                    self.root.after(0, lambda: self.progress_table.update_shelf_data(shelf_data))
+                # Use thread-safe update
+                self.safe_gui_update(self.progress_table.update_shelf_data, shelf_data)
                 
                 self.publisher_shelf_data.publish(shelf_data)
             
-            # Shelf detection
-            if self.shelf_detection_enabled:
-                shelf_detected = self.detect_shelf(image)
-                if shelf_detected:
-                    current_time = self.get_clock().now()
-                    if True:  # 1 second
-                        self.get_logger().info("SHELF DETECTED!")
-                        self.last_shelf_detection_time = current_time
+            # Keep the rest of your camera callback code
             
-            # Publish debug images
-            if points is not None and len(points) > 0:
-                debug_image = image.copy()
-                cv2.polylines(debug_image, [np.int32(points)], True, (0, 255, 0), 3)
-                
-                if decoded_text:
-                    cv2.putText(debug_image, decoded_text, 
-                               (int(points[0][0][0]), int(points[0][0][1])-10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                
-                self.publish_debug_image(self.publisher_qr_decode, debug_image)
-            else:
-                self.publish_debug_image(self.publisher_qr_decode, image)
-                
         except Exception as e:
             self.get_logger().error(f'Error processing image: {str(e)}')
-
-    def detect_shelf(self, image):
-        try:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            edges = cv2.Canny(blurred, 50, 150)
-            
-            contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-            
-            debug_img = image.copy()
-            shelf_detected = False
-            
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area < self.min_shelf_contour_area:
-                    continue
-                
-                epsilon = 0.02 * cv2.arcLength(contour, True)
-                approx = cv2.approxPolyDP(contour, epsilon, True)
-                
-                if len(approx) == 4:
-                    x, y, w, h = cv2.boundingRect(contour)
-                    aspect_ratio = float(w)/h
-                    
-                    hull = cv2.convexHull(contour)
-                    hull_area = cv2.contourArea(hull)
-                    solidity = float(area)/hull_area if hull_area > 0 else 0
-                    
-                    if (self.shelf_aspect_ratio_range[0] < aspect_ratio < self.shelf_aspect_ratio_range[1] and
-                        solidity > self.shelf_solidity_threshold):
-                        
-                        shelf_detected = True
-                        cv2.drawContours(debug_img, [contour], -1, (0, 255, 0), 2)
-                        cv2.putText(debug_img, "Shelf", (x, y-10), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            self.publish_debug_image(self.publisher_shelf_debug, debug_img)
-            return shelf_detected
-            
-        except Exception as e:
-            self.get_logger().error(f'Error in shelf detection: {str(e)}')
-            return False
-
-    def publish_debug_image(self, publisher, image):
-        if image.size:
-            message = CompressedImage()
-            _, encoded_data = cv2.imencode('.jpg', image)
-            message.format = "jpeg"
-            message.data = encoded_data.tobytes()
-            publisher.publish(message)
 
     def cerebri_status_callback(self, message):
         prev_armed = self.armed
@@ -730,11 +674,11 @@ class WarehouseExplore(Node):
     def shelf_objects_callback(self, msg):
         try:
             self.shelf_objects_curr = msg
-            # self.get_logger().info(f"Received shelf objects: {msg.object_name}")
-
-            if PROGRESS_TABLE_GUI:
-                # Use thread-safe method to update GUI
-                self.root.after(0, lambda: self.progress_table.update_shelf_data(msg))
+            self.get_logger().info(f"Received shelf objects: {msg.object_name}")
+            
+            # Use thread-safe update
+            self.safe_gui_update(self.progress_table.update_shelf_data, msg)
+            
         except Exception as e:
             self.get_logger().error(f"Error processing shelf objects: {e}")
 
