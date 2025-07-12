@@ -15,6 +15,9 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionClient
+from nav2_msgs.action import NavigateToPose
+from action_msgs.msg import GoalStatus
 from time import sleep
 import numpy as np
 import cv2
@@ -208,12 +211,43 @@ class WarehouseExplore(Node):
         self.target_angle_deg = self.get_parameter('initial_angle').get_parameter_value().double_value
         self.target_angle_rad = math.radians(self.target_angle_deg)
         
+        # Nav2 Action Client
+        self.nav_action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        
+        # Navigation state variables
+        self.navigation_active = False
+        self.navigation_goal_handle = None
+        self.initial_position_set = False
+        self.initial_x = 0.0
+        self.initial_y = 0.0
+        
+        self.get_logger().info(f"Target alignment angle: {self.target_angle_deg}° ({self.target_angle_rad:.3f} rad)")
+
+        # Fix GUI threading issues with try-except
+        if PROGRESS_TABLE_GUI:
+            try:
+                self.root = tk.Tk()
+                self.root.protocol("WM_DELETE_WINDOW", self.on_closing)  # Handle window closing
+                self.progress_table = WindowProgressTable(self.root, self.shelf_count)
+                self.gui_thread = Thread(target=self.gui_mainloop, daemon=True)
+                self.gui_thread.start()
+                self.get_logger().info("GUI initialized successfully")
+            except Exception as e:
+                self.get_logger().error(f"Failed to initialize GUI: {e}")
+                self.root = None
+        
+        # Add timer to check Nav2 availability
+        self.create_timer(5.0, self.check_nav2_status)
+
+        # Add a timer to test navigation after initialization
+        self.create_timer(10.0, self.test_navigation)
+
         # Alignment control variables
         self.alignment_active = True
         self.alignment_tolerance = 0.087  # radians (~5 degrees) - increased tolerance
-        self.angular_velocity_gain = 1.0  # Increased gain
-        self.max_angular_velocity = 0.5   # Increased max velocity
-        self.min_angular_velocity = 0.15  # Increased minimum velocity
+        self.angular_velocity_gain = 0.1  # Increased gain
+        self.max_angular_velocity = 0.75   # Increased max velocity
+        self.min_angular_velocity = 0.5  # Increased minimum velocity
         
         self.get_logger().info(f"Target alignment angle: {self.target_angle_deg}° ({self.target_angle_rad:.3f} rad)")
 
@@ -293,6 +327,120 @@ class WarehouseExplore(Node):
         self.last_yaw = 0.0
         self.alignment_start_time = None
 
+    def gui_mainloop(self):
+        """Run GUI mainloop with error handling"""
+        try:
+            self.root.mainloop()
+        except Exception as e:
+            self.get_logger().error(f"GUI error: {e}")
+
+    def on_closing(self):
+        """Handle GUI window closing"""
+        if self.root:
+            self.root.destroy()
+            self.root = None
+
+    def check_nav2_status(self):
+        """Check if Nav2 server is available"""
+        if self.nav_action_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().info("Nav2 server is available")
+        else:
+            self.get_logger().warn("Nav2 server is NOT available!")
+
+    def test_navigation(self):
+        """Test navigation by sending a simple goal"""
+        if not self.armed:
+            self.get_logger().warn("Robot not armed - skipping test navigation")
+            return
+            
+        if not self.initial_position_set:
+            self.get_logger().warn("Initial position not set - skipping test navigation")
+            return
+            
+        # Navigate to a point 1 meter ahead in the direction of the target angle
+        target_x = self.initial_x + 1.0 * math.cos(self.target_angle_rad)
+        target_y = self.initial_y + 1.0 * math.sin(self.target_angle_rad)
+        
+        self.get_logger().info(f"Testing navigation - moving 1 meter ahead to ({target_x:.2f}, {target_y:.2f})")
+        self.navigate_to_pose(target_x, target_y, self.target_angle_rad)
+
+    def euler_to_quaternion(self, yaw):
+        """Convert yaw angle to quaternion"""
+        from geometry_msgs.msg import Quaternion
+        quat = Quaternion()
+        quat.x = 0.0
+        quat.y = 0.0
+        quat.z = math.sin(yaw / 2.0)
+        quat.w = math.cos(yaw / 2.0)
+        return quat
+
+    def navigate_to_pose(self, x, y, yaw):
+        """Navigate to a specific pose using Nav2"""
+        if not self.armed:
+            self.get_logger().warn("Robot not armed - cannot navigate")
+            return False
+            
+        if not self.nav_action_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("Nav2 server not available!")
+            return False
+
+        # Create goal message
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = "map"
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        
+        # Set position
+        goal_msg.pose.pose.position.x = x
+        goal_msg.pose.pose.position.y = y
+        goal_msg.pose.pose.position.z = 0.0
+        
+        # Set orientation
+        goal_msg.pose.pose.orientation = self.euler_to_quaternion(yaw)
+        
+        self.get_logger().info(f"Navigating to: x={x:.3f}, y={y:.3f}, yaw={math.degrees(yaw):.1f}°")
+        
+        # Send goal
+        self.navigation_goal_handle = self.nav_action_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self.navigation_feedback_callback
+        )
+        self.navigation_goal_handle.add_done_callback(self.navigation_goal_response_callback)
+        
+        self.navigation_active = True
+        return True
+
+    def navigation_goal_response_callback(self, future):
+        """Handle navigation goal response"""
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error("Navigation goal rejected!")
+            self.navigation_active = False
+            return
+        
+        self.get_logger().info("Navigation goal accepted")
+        
+        # Get result
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.navigation_result_callback)
+
+    def navigation_feedback_callback(self, feedback_msg):
+        """Handle navigation feedback"""
+        feedback = feedback_msg.feedback
+        distance_remaining = feedback.distance_remaining
+        
+        self.get_logger().info(f"Navigation feedback: {distance_remaining:.2f}m remaining")
+
+    def navigation_result_callback(self, future):
+        """Handle navigation result"""
+        status = future.result().status
+        
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info("Navigation completed successfully!")
+        else:
+            self.get_logger().error(f"Navigation failed with status: {status}")
+        
+        self.navigation_active = False
+
     def quaternion_to_euler(self, x, y, z, w):
         """Convert quaternion to euler angles (yaw)"""
         siny_cosp = 2 * (w * z + x * y)
@@ -313,16 +461,17 @@ class WarehouseExplore(Node):
         self.buggy_pose_x = message.pose.pose.position.x
         self.buggy_pose_y = message.pose.pose.position.y
         
-        # Extract current yaw from quaternion
-        orientation = message.pose.pose.orientation
-        self.last_yaw = self.current_yaw
-        self.current_yaw = self.quaternion_to_euler(
-            orientation.x, orientation.y, orientation.z, orientation.w
-        )
-        
-        # Perform alignment if active and armed
-        if self.alignment_active and self.armed:
-            self.perform_alignment()
+        # Store initial position when first pose is received
+        if not self.initial_position_set:
+            self.initial_x = self.buggy_pose_x
+            self.initial_y = self.buggy_pose_y
+            self.initial_position_set = True
+            self.get_logger().info(f"Initial position set: x={self.initial_x:.3f}, y={self.initial_y:.3f}")
+
+    def navigate_to_initial_orientation(self):
+        """Navigate to the initial position but with the target orientation"""
+        if self.armed and self.initial_position_set:
+            self.navigate_to_pose(self.initial_x, self.initial_y, self.target_angle_rad)
 
     def perform_alignment(self):
         """Align the robot to the target angle"""
@@ -486,10 +635,12 @@ class WarehouseExplore(Node):
             self.armed = True
             if not prev_armed:
                 self.get_logger().info("Robot armed - starting alignment")
-                self.alignment_active = True
-                self.alignment_start_time = None
+                # You could directly initiate navigation here if needed
         else:
-            pass
+            self.armed = False
+            if prev_armed:
+                self.get_logger().info("Robot disarmed - cancelling navigation")
+                # Cancel any active navigation
             
             # Send arming command
             msg = Joy()
