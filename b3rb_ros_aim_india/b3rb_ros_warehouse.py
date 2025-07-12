@@ -15,14 +15,15 @@
 
 import rclpy
 from rclpy.node import Node
-
+from time import sleep
 import numpy as np
 import cv2
 import tkinter as tk
 from threading import Thread
+import math
 
 from sensor_msgs.msg import Joy, CompressedImage
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from synapse_msgs.msg import Status, WarehouseShelf
 
 QOS_PROFILE_DEFAULT = 10
@@ -201,6 +202,20 @@ class WarehouseExplore(Node):
         
         self.declare_parameter('shelf_count', 1)
         self.shelf_count = self.get_parameter('shelf_count').get_parameter_value().integer_value
+        
+        # Declare alignment parameters
+        self.declare_parameter('initial_angle', 0.0)
+        self.target_angle_deg = self.get_parameter('initial_angle').get_parameter_value().double_value
+        self.target_angle_rad = math.radians(self.target_angle_deg)
+        
+        # Alignment control variables
+        self.alignment_active = True
+        self.alignment_tolerance = 0.087  # radians (~5 degrees) - increased tolerance
+        self.angular_velocity_gain = 1.0  # Increased gain
+        self.max_angular_velocity = 0.5   # Increased max velocity
+        self.min_angular_velocity = 0.15  # Increased minimum velocity
+        
+        self.get_logger().info(f"Target alignment angle: {self.target_angle_deg}° ({self.target_angle_rad:.3f} rad)")
 
         if PROGRESS_TABLE_GUI:
             self.root = tk.Tk()
@@ -246,6 +261,12 @@ class WarehouseExplore(Node):
             '/cerebri/in/joy',
             QOS_PROFILE_DEFAULT)
 
+        # Add cmd_vel publisher for direct robot control
+        self.publisher_cmd_vel = self.create_publisher(
+            Twist,
+            '/cmd_vel',
+            QOS_PROFILE_DEFAULT)
+
         self.publisher_qr_decode = self.create_publisher(
             CompressedImage,
             "/debug_images/qr_code",
@@ -268,16 +289,99 @@ class WarehouseExplore(Node):
         self.pose_curr = None
         self.buggy_pose_x = 0.0
         self.buggy_pose_y = 0.0
+        self.current_yaw = 0.0
+        self.last_yaw = 0.0
+        self.alignment_start_time = None
+
+    def quaternion_to_euler(self, x, y, z, w):
+        """Convert quaternion to euler angles (yaw)"""
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        return yaw
+
+    def normalize_angle(self, angle):
+        """Normalize angle to [-pi, pi]"""
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
 
     def pose_callback(self, message):
         self.pose_curr = message
         self.buggy_pose_x = message.pose.pose.position.x
         self.buggy_pose_y = message.pose.pose.position.y
+        
+        # Extract current yaw from quaternion
+        orientation = message.pose.pose.orientation
+        self.last_yaw = self.current_yaw
+        self.current_yaw = self.quaternion_to_euler(
+            orientation.x, orientation.y, orientation.z, orientation.w
+        )
+        
+        # Perform alignment if active and armed
+        if self.alignment_active and self.armed:
+            self.perform_alignment()
+
+    def perform_alignment(self):
+        """Align the robot to the target angle"""
+        if self.alignment_start_time is None:
+            self.alignment_start_time = self.get_clock().now()
+        
+        # Calculate angle difference
+        angle_diff = self.normalize_angle(self.target_angle_rad - self.current_yaw)
+        
+        # Check if alignment is complete
+        if abs(angle_diff) < self.alignment_tolerance:
+            if self.alignment_active:
+                self.get_logger().info(f"Alignment complete! Current angle: {math.degrees(self.current_yaw):.1f}°")
+                self.alignment_active = False
+                # Stop the robot
+                self.rover_move_cmd_vel(0.0, 0.0)
+            return
+        
+        # Check for timeout (30 seconds)
+        elapsed_time = (self.get_clock().now() - self.alignment_start_time).nanoseconds / 1e9
+        if elapsed_time > 30.0:
+            self.get_logger().warn("Alignment timeout reached, stopping alignment")
+            self.alignment_active = False
+            self.rover_move_cmd_vel(0.0, 0.0)
+            return
+        
+        # For steering drive: need both linear and angular velocity
+        # Calculate angular velocity with proportional control
+        angular_velocity = self.angular_velocity_gain * angle_diff
+        
+        # Limit angular velocity
+        angular_velocity = max(min(angular_velocity, self.max_angular_velocity), -self.max_angular_velocity)
+        
+        # Apply minimum angular velocity to overcome static friction
+        if abs(angular_velocity) < self.min_angular_velocity:
+            angular_velocity = self.min_angular_velocity if angular_velocity > 0 else -self.min_angular_velocity
+        
+        # For steering drive, provide small forward velocity to enable turning
+        linear_velocity = 0.5  # Small forward velocity to enable steering
+        
+        # Send movement command using both methods
+        self.rover_move_cmd_vel(linear_velocity, angular_velocity)
+        self.rover_move_manual_mode(linear_velocity, angular_velocity)
+        
+        # Log progress
+        self.get_logger().info(f"Aligning: Current={math.degrees(self.current_yaw):.1f}°, "
+                              f"Target={self.target_angle_deg:.1f}°, "
+                              f"Error={math.degrees(angle_diff):.1f}°, "
+                              f"LinVel={linear_velocity:.3f}, AngVel={angular_velocity:.3f}")
+
+    def rover_move_cmd_vel(self, linear_velocity, angular_velocity):
+        """Send movement command using Twist message on /cmd_vel topic"""
+        twist = Twist()
+        twist.linear.x = linear_velocity
+        twist.angular.z = angular_velocity
+        self.publisher_cmd_vel.publish(twist)
 
     def camera_image_callback(self, message):
-        if PROGRESS_TABLE_GUI:
-            self.root.update_idletasks()
-            self.root.update()
+        # Remove GUI updates from callback to prevent threading issues
         
         try:
             np_arr = np.frombuffer(message.data, np.uint8)
@@ -295,8 +399,8 @@ class WarehouseExplore(Node):
                 shelf_data.qr_decoded = decoded_text
                 
                 if PROGRESS_TABLE_GUI:
-                    self.progress_table.update_shelf_data(shelf_data)
-                    self.root.update_idletasks()
+                    # Use thread-safe method to update GUI
+                    self.root.after(0, lambda: self.progress_table.update_shelf_data(shelf_data))
                 
                 self.publisher_shelf_data.publish(shelf_data)
             
@@ -377,9 +481,17 @@ class WarehouseExplore(Node):
             publisher.publish(message)
 
     def cerebri_status_callback(self, message):
+        prev_armed = self.armed
         if message.mode == 3 and message.arming == 2:
             self.armed = True
+            if not prev_armed:
+                self.get_logger().info("Robot armed - starting alignment")
+                self.alignment_active = True
+                self.alignment_start_time = None
         else:
+            pass
+            
+            # Send arming command
             msg = Joy()
             msg.buttons = [0, 1, 0, 0, 0, 0, 0, 1]
             msg.axes = [0.0, 0.0, 0.0, 0.0]
@@ -391,8 +503,8 @@ class WarehouseExplore(Node):
             # self.get_logger().info(f"Received shelf objects: {msg.object_name}")
 
             if PROGRESS_TABLE_GUI:
-                self.progress_table.update_shelf_data(msg)
-                self.root.update_idletasks()
+                # Use thread-safe method to update GUI
+                self.root.after(0, lambda: self.progress_table.update_shelf_data(msg))
         except Exception as e:
             self.get_logger().error(f"Error processing shelf objects: {e}")
 
@@ -403,6 +515,9 @@ class WarehouseExplore(Node):
         self.publisher_joy.publish(msg)
 
 def main(args=None):
+    # a sleep timer for 7 seconds to let initialize things properly
+    sleep(7.0)
+
     rclpy.init(args=args)
     warehouse_explore = WarehouseExplore()
     
