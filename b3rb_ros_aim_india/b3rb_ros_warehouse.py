@@ -1,4 +1,3 @@
-
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
@@ -10,6 +9,8 @@ import cv2
 import tkinter as tk
 from threading import Thread
 import math
+import signal
+import sys
 
 from sensor_msgs.msg import Joy, CompressedImage
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist, PoseStamped
@@ -28,6 +29,9 @@ class WindowProgressTable:
         self.root.geometry("900x600")
         self.root.resizable(False, False)
         
+        # Handle window close event
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
         self.headers = ["Shelf", "Objects Detected", "QR Code"]
         self.shelf_count = shelf_count
         self.current_shelf_index = 0
@@ -37,7 +41,10 @@ class WindowProgressTable:
         self.boxes = []
         self.create_table()
         
-
+    def on_closing(self):
+        """Handle window close event"""
+        self.root.quit()
+        self.root.destroy()
 
     def create_table(self):
         header_row = []
@@ -194,6 +201,7 @@ class WarehouseExplore(Node):
     def __init__(self):
         super().__init__('warehouse_explore')
         self.shelf_found = False
+        self.node_shutdown = False
         self.declare_parameter('shelf_count', 1)
         self.shelf_count = self.get_parameter('shelf_count').get_parameter_value().integer_value
         
@@ -215,6 +223,7 @@ class WarehouseExplore(Node):
         if PROGRESS_TABLE_GUI:
             self.gui_initialized = False
             self.gui_queue = []
+            self.gui_thread = None
             self.init_gui()
         
         # Add a timer to test navigation after initialization
@@ -302,7 +311,7 @@ class WarehouseExplore(Node):
                 
             self.root.mainloop()
             
-        self.gui_thread = Thread(target=gui_thread_func, daemon=True)
+        self.gui_thread = Thread(target=gui_thread_func, daemon=False)  # Not daemon so it stays alive
         self.gui_thread.start()
     
     def safe_gui_update(self, func, *args):
@@ -315,23 +324,35 @@ class WarehouseExplore(Node):
         else:
             self.gui_queue.append((func, args))
 
-    def gui_mainloop(self):
-        """Run GUI mainloop with error handling"""
+    def stop_robot_immediately(self):
+        """Stop all robot movement immediately"""
         try:
-            self.root.mainloop()
+            # Cancel any ongoing navigation
+            if hasattr(self, '_get_result_future') and self._get_result_future:
+                self._get_result_future.cancel()
+            
+            # Send stop command multiple times to ensure it's received
+            for _ in range(5):
+                twist = Twist()
+                twist.linear.x = 0.0
+                twist.linear.y = 0.0
+                twist.linear.z = 0.0
+                twist.angular.x = 0.0
+                twist.angular.y = 0.0
+                twist.angular.z = 0.0
+                self.publisher_cmd_vel.publish(twist)
+                sleep(0.1)
+            
+            self.navigation_active = False
+            self.get_logger().info("Robot stopped - all movement commands sent")
+            
         except Exception as e:
-            pass
+            self.get_logger().error(f"Error stopping robot: {e}")
 
-    def on_closing(self):
-        """Handle GUI window closing"""
-        if self.root:
-            self.root.destroy()
-            self.root = None
-        
     def initial_navigation(self):
         """Start navigation by sending first goal"""
-        if not self.initial_position_set:
-            self.get_logger().warn("Initial position not set yet, waiting...")
+        if not self.initial_position_set or self.shelf_found:
+            self.get_logger().warn("Initial position not set yet or shelf already found, waiting...")
             return
             
         self.get_logger().info("Starting step-by-step navigation in target direction")
@@ -339,7 +360,7 @@ class WarehouseExplore(Node):
 
     def send_next_navigation_goal(self):
         """Send next navigation goal in the target direction"""
-        if self.shelf_found or self.navigation_active:
+        if self.shelf_found or self.navigation_active or self.node_shutdown:
             return
             
         # Calculate next target position
@@ -372,7 +393,7 @@ class WarehouseExplore(Node):
 
     def navigate_to_pose(self, x, y, yaw):
         """Navigate to a specific pose"""
-        if self.shelf_found or self.navigation_active:
+        if self.shelf_found or self.navigation_active or self.node_shutdown:
             return False
         
         self.navigation_active = True
@@ -398,6 +419,9 @@ class WarehouseExplore(Node):
 
     def nav_response_callback(self, future):
         """Handle the response from the NavigateToPose action server"""
+        if self.shelf_found or self.node_shutdown:
+            return
+            
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().error('Navigation goal rejected')
@@ -411,22 +435,29 @@ class WarehouseExplore(Node):
     def nav_result_callback(self, future):
         """Handle the result of the NavigateToPose action"""
         self.navigation_active = False
+        
+        if self.shelf_found or self.node_shutdown:
+            return
+            
         status = future.result().status
         
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('Navigation goal succeeded')
             # Only send next goal if shelf not found
-            if not self.shelf_found:
+            if not self.shelf_found and not self.node_shutdown:
                 # Small delay before sending next goal to allow system to stabilize
                 self.create_timer(1.0, self.send_next_navigation_goal)
         else:
             self.get_logger().warning(f'Navigation failed with status {status}')
             # Try again after a delay
-            if not self.shelf_found:
+            if not self.shelf_found and not self.node_shutdown:
                 self.create_timer(2.0, self.send_next_navigation_goal)
 
     def navigation_feedback_callback(self, feedback_msg):
         """Handle navigation feedback with rate limiting"""
+        if self.shelf_found or self.node_shutdown:
+            return
+            
         try:
             feedback = feedback_msg.feedback
             current_time = self.get_clock().now()
@@ -468,6 +499,9 @@ class WarehouseExplore(Node):
         return angle
 
     def pose_callback(self, message):
+        if self.shelf_found or self.node_shutdown:
+            return
+            
         self.pose_curr = message
         self.buggy_pose_x = message.pose.pose.position.x
         self.buggy_pose_y = message.pose.pose.position.y
@@ -480,13 +514,22 @@ class WarehouseExplore(Node):
         
         # Store initial position when first pose is received
         if not self.initial_position_set:
+            sleep(5.0)
             self.initial_x = self.buggy_pose_x
             self.initial_y = self.buggy_pose_y
             self.initial_yaw = self.current_yaw
             self.initial_position_set = True
+            
+            target_x = self.buggy_pose_x + 1.8 * math.cos(self.target_angle_rad + 0.01745)
+            target_y = self.buggy_pose_y + 1.8 * math.sin(self.target_angle_rad + 0.01745)
+            self.navigate_to_pose(target_x, target_y, self.target_angle_rad)
+            
             self.get_logger().info(f"Initial position set: x={self.initial_x:.3f}, y={self.initial_y:.3f}")
 
     def camera_image_callback(self, message):
+        if self.node_shutdown:
+            return
+            
         try:
             np_arr = np.frombuffer(message.data, np.uint8)
             image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -506,24 +549,25 @@ class WarehouseExplore(Node):
                 
                 self.publisher_shelf_data.publish(shelf_data)
             
-            # Shelf detection
-            shelf_detected = self.detect_shelf(image)
-            if shelf_detected and not self.shelf_found:    
-                self.get_logger().info("SHELF DETECTED! Stopping navigation.")
-                self.shelf_found = True
-                
-                # Cancel any ongoing navigation
-                if hasattr(self, '_get_result_future') and self._get_result_future:
-                    self._get_result_future.cancel()
+            # Shelf detection - only if not already found
+            if not self.shelf_found:
+                shelf_detected = self.detect_shelf(image)
+                if shelf_detected:    
+                    self.get_logger().info("SHELF DETECTED! Stopping robot immediately.")
+                    self.shelf_found = True
                     
-                # Stop robot movement
-                twist = Twist()
-                self.publisher_cmd_vel.publish(twist)
+                    # Stop robot immediately
+                    self.stop_robot_immediately()
+                    
+                    self.get_logger().info("Robot stopped. GUI will remain active for data collection.")
             
         except Exception as e:
             pass
 
     def cerebri_status_callback(self, message):
+        if self.node_shutdown:
+            return
+            
         prev_armed = self.armed
         if message.mode == 3 and message.arming == 2:
             self.armed = True
@@ -537,6 +581,9 @@ class WarehouseExplore(Node):
             self.publisher_joy.publish(msg)
 
     def shelf_objects_callback(self, msg):
+        if self.node_shutdown:
+            return
+            
         try:
             self.shelf_objects_curr = msg
             
@@ -576,18 +623,58 @@ class WarehouseExplore(Node):
         
         return False
 
+    def destroy_node(self):
+        """Clean shutdown of the node"""
+        self.node_shutdown = True
+        self.get_logger().info("Node shutting down...")
+        
+        # Stop robot one more time
+        self.stop_robot_immediately()
+        
+        # Call parent destroy
+        super().destroy_node()
+
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully"""
+    print("\nShutdown signal received. Stopping robot and keeping GUI open...")
+    sys.exit(0)
+
+
 def main(args=None):
     sleep(7.0)
+    
+    # Set up signal handler for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    
     rclpy.init(args=args)
     warehouse_explore = WarehouseExplore()
     
     try:
         rclpy.spin(warehouse_explore)
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt received")
     except Exception as e:
-        pass
+        print(f"Exception in main: {e}")
     finally:
-        warehouse_explore.destroy_node()
-        rclpy.shutdown()
+        try:
+            warehouse_explore.destroy_node()
+        except:
+            pass
+        
+        try:
+            rclpy.shutdown()
+        except:
+            pass
+        
+        print("ROS node shutdown complete. GUI will remain active.")
+        
+        # Keep the process alive if GUI is still running
+        if PROGRESS_TABLE_GUI and hasattr(warehouse_explore, 'gui_thread'):
+            try:
+                warehouse_explore.gui_thread.join()
+            except:
+                pass
 
 if __name__ == '__main__':
     main()
