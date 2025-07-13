@@ -26,7 +26,7 @@ from threading import Thread
 import math
 
 from sensor_msgs.msg import Joy, CompressedImage
-from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist, PoseStamped
 from synapse_msgs.msg import Status, WarehouseShelf
 
 QOS_PROFILE_DEFAULT = 10
@@ -202,11 +202,15 @@ class WindowProgressTable:
             
         except Exception as e:
             print(f"Error updating QR display: {e}")
+    
 
 class WarehouseExplore(Node):
     def __init__(self):
         super().__init__('warehouse_explore')
-        
+        self.continuous_forward_active = False
+        self.navigation_completed = False
+        self.shelf_found = False
+        self.forward_speed = 0.75  # m/s
         self.declare_parameter('shelf_count', 1)
         self.shelf_count = self.get_parameter('shelf_count').get_parameter_value().integer_value
         
@@ -241,7 +245,7 @@ class WarehouseExplore(Node):
 
         # Alignment control variables
         self.alignment_active = True
-        self.alignment_tolerance = 0.01  # radians (~5 degrees) - increased tolerance
+        self.alignment_tolerance = 0.00  # radians (~5 degrees) - increased tolerance
         self.angular_velocity_gain = 0.1  # Increased gain
         self.max_angular_velocity = 0.75   # Increased max velocity
         self.min_angular_velocity = 0.5  # Increased minimum velocity
@@ -317,6 +321,7 @@ class WarehouseExplore(Node):
         self.current_yaw = 0.0
         self.last_yaw = 0.0
         self.alignment_start_time = None
+        self.continuous_forward_active = False
 
     def init_gui(self):
         """Initialize GUI in a separate thread"""
@@ -360,6 +365,43 @@ class WarehouseExplore(Node):
             self.root.destroy()
             self.root = None
 
+
+    def handle_navigation_completed(self):
+        self.get_logger().info("Navigation completed - continuing forward movement")
+        self.navigation_completed = True
+        self.start_forward_movement()
+        
+    def start_forward_movement(self):
+        self.continuous_forward_active = True
+        self.forward_speed = 0.5  # m/s
+        
+        if hasattr(self, 'forward_timer'):
+            self.forward_timer.cancel()
+        self.forward_timer = self.create_timer(0.1, self.forward_motion_callback)
+        self.get_logger().info("forward motion activated")
+        
+        # Cancel any ongoing navigation and prevent new navigation
+        if hasattr(self, '_get_result_future') and self._get_result_future:
+            self._get_result_future.cancel()
+    
+    def forward_motion_callback(self):
+        """Timer callback to maintain forward motion"""
+        current_time = self.get_clock().now()
+        elapsed = (current_time - self.last_shelf_detection_time).nanoseconds / 1e9
+        
+        if self.continuous_forward_active and not self.shelf_found:
+            self.rover_move_cmd_vel(20*self.forward_speed, 0.0)
+
+         
+        else:
+            
+            if hasattr(self, 'forward_timer'):
+                
+                self.forward_timer.cancel()
+                self.rover_move_cmd_vel(0.0, 0.0)  # Make sure to stop the robot
+                self.get_logger().info("Continuous forward motion stopped")
+                
+
     def check_nav2_status(self):
         """Check if Nav2 server is available"""
         if self.nav_action_client.wait_for_server(timeout_sec=1.0):
@@ -371,6 +413,10 @@ class WarehouseExplore(Node):
 
     def test_navigation(self):
         """Test navigation by sending a simple goal"""
+        if self.continuous_forward_active:
+            self.get_logger().info("Skipping navigation - continuous forward movement is active")
+            return
+            
         if not self.armed:
             # self.get_logger().warn("Robot not armed - skipping test navigation")
             return
@@ -409,65 +455,73 @@ class WarehouseExplore(Node):
         return quat
 
     def navigate_to_pose(self, x, y, yaw):
-        """Navigate to a specific pose using Nav2 with improved angle handling"""
-        if not self.armed:
-            # self.get_logger().warn("Robot not armed - cannot navigate")
+        """Navigate to a specific pose"""
+        # Create the PoseStamped message
+        
+        if self.continuous_forward_active or self.shelf_found:
+            self.get_logger().info("Skipping navigation")
             return False
-            
-        if not self.nav_action_client.wait_for_server(timeout_sec=1.0):
-            # self.get_logger().error("Nav2 server not available!")
-            return False
+        
+        
+        
+        pose = PoseStamped()
+        pose.header.frame_id = "map"
+        pose.header.stamp = self.get_clock().now().to_msg()
+        
+        pose.pose.position.x = x
+        pose.pose.position.y = y
+        pose.pose.position.z = 0.0
+        
+        quat = self.euler_to_quaternion(yaw)
+        pose.pose.orientation = quat
+        
+        # Send the goal
+        self.get_logger().info(f"Navigating to ({x:.2f}, {y:.2f}, {math.degrees(yaw):.1f}°)")
+        self.nav_action_client.send_goal_async(
+            NavigateToPose.Goal(pose=pose),
+            feedback_callback=self.navigation_feedback_callback
+        ).add_done_callback(self.nav_response_callback)
+        
+        return True
 
-        # Normalize the target yaw angle
-        yaw = self.normalize_angle(yaw)
-
-        # Create goal message
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose.header.frame_id = "map"
-        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
-        
-        # Set position
-        goal_msg.pose.pose.position.x = float(x)  # Ensure values are floats
-        goal_msg.pose.pose.position.y = float(y)
-        goal_msg.pose.pose.position.z = 0.0
-        
-        # Set orientation with proper normalization
-        goal_msg.pose.pose.orientation = self.euler_to_quaternion(yaw)
-        
-        # # self.get_logger().info(
-        #     f"Navigating to: x={x:.3f}, y={y:.3f}, yaw={math.degrees(yaw):.1f}° "
-        #     f"quat=({goal_msg.pose.pose.orientation.w:.2f}, {goal_msg.pose.pose.orientation.x:.2f}, "
-        #     f"{goal_msg.pose.pose.orientation.y:.2f}, {goal_msg.pose.pose.orientation.z:.2f})"
-        # )
-        
-        try:
-            # Send goal
-            self.navigation_goal_handle = self.nav_action_client.send_goal_async(
-                goal_msg,
-                feedback_callback=self.navigation_feedback_callback
-            )
-            self.navigation_goal_handle.add_done_callback(self.navigation_goal_response_callback)
-            
-            self.navigation_active = True
-            return True
-        except Exception as e:
-            # self.get_logger().error(f"Error sending navigation goal: {e}")
-            self.navigation_active = False
-            return False
-
-    def navigation_goal_response_callback(self, future):
-        """Handle navigation goal response"""
+    def nav_response_callback(self, future):
+        """Handle the response from the NavigateToPose action server"""
         goal_handle = future.result()
         if not goal_handle.accepted:
-            # self.get_logger().error("Navigation goal rejected!")
-            self.navigation_active = False
+            self.get_logger().error('Navigation goal rejected')
             return
         
-        # self.get_logger().info("Navigation goal accepted")
+        if not self.navigation_completed:
+            self.get_logger().info('Navigation goal accepted')
+            self._get_result_future = goal_handle.get_result_async()
+            self._get_result_future.add_done_callback(self.nav_result_callback)
+
+    def nav_result_callback(self, future):
+        """Handle the result of the NavigateToPose action"""
+        status = future.result().status
+        result = future.result().result
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info(f'Navigation succeded')
+            self.navigation_completed = True
+            self.handle_navigation_completed()
+        else:
+            self.get_logger().warning(f'Navigation failed with status {status}')
+            self.navigation_completed = False
         
-        # Get result
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self.navigation_result_callback)
+
+
+
+
+    def forward_motion_callback(self):
+        """Timer callback to maintain forward motion"""
+        if self.continuous_forward_active and not self.shelf_found:
+            self.rover_move_cmd_vel(3.0, 0.0)
+        else:
+            # If shelf found or motion deactivated, stop the timer
+            if hasattr(self, 'forward_timer'):
+                self.forward_timer.cancel()
+                self.get_logger().info("Continuous forward motion stopped")
+        
 
     def navigation_feedback_callback(self, feedback_msg):
         """Handle navigation feedback with rate limiting"""
@@ -493,27 +547,9 @@ class WarehouseExplore(Node):
                 current_yaw = self.quaternion_to_euler(
                     orientation.x, orientation.y, orientation.z, orientation.w
                 )
-                
-                # self.get_logger().info(
-                #     f"Navigation progress: pos=({current_x:.2f}, {current_y:.2f}), "
-                #     f"yaw={math.degrees(current_yaw):.1f}°, "
-                #     f"remaining={distance_remaining:.2f}m"
-                # )
+
         except Exception as e:
             pass
-            # self.get_logger().error(f"Error in navigation feedback: {e}")
-
-    def navigation_result_callback(self, future):
-        """Handle navigation result"""
-        status = future.result().status
-        
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info("Navigation completed successfully!")
-        else:
-            # self.get_logger().error(f"Navigation failed with status: {status}")
-            pass
-        
-        self.navigation_active = False
 
     def quaternion_to_euler(self, x, y, z, w):
         """Convert quaternion to euler angles (yaw) with improved robustness"""
@@ -559,22 +595,7 @@ class WarehouseExplore(Node):
             self.initial_position_set = True
             # self.get_logger().info(f"Initial position set: x={self.initial_x:.3f}, y={self.initial_y:.3f}, yaw={math.degrees(self.initial_yaw):.1f}°")
 
-    def navigate_to_initial_orientation(self):
-        """Navigate to the initial position but with the target orientation"""
-        if self.armed and self.initial_position_set and not self.navigation_active:
-            # Normalize target angle
-            target_yaw = self.normalize_angle(self.target_angle_rad)
-            
-            # self.get_logger().info(f"Navigating to initial position with target orientation: {math.degrees(target_yaw):.1f}°")
-            return self.navigate_to_pose(self.initial_x, self.initial_y, target_yaw)
-        else:
-            # if not self.armed:
-            #     self.get_logger().warn("Cannot navigate - robot not armed")
-            # elif not self.initial_position_set:
-            #     self.get_logger().warn("Cannot navigate - initial position not set")
-            # elif self.navigation_active:
-            #     self.get_logger().warn("Cannot navigate - navigation already active")
-            return False
+    
 
     def perform_alignment(self):
         """Align the robot to the target angle"""
@@ -657,10 +678,12 @@ class WarehouseExplore(Node):
             shelf_detected = self.detect_shelf(image)
             if shelf_detected:    
                 self.get_logger().info("SHELF DETECTED!")
+                self.rover_move_cmd_vel(0.0, 0.0)  # Stop the robot
+                self.get_logger().info("Stopping robot for shelf detection")
+                self.shelf_found = True
+                self.continuous_forward_active = False
   
-            
-            
-            # Keep the rest of your camera callback code
+
             
         except Exception as e:
             pass
@@ -693,7 +716,8 @@ class WarehouseExplore(Node):
             # self.get_logger().info(f"Received shelf objects: {msg.object_name}")
             
             # Use thread-safe update
-            self.safe_gui_update(self.progress_table.update_shelf_data, msg)
+            if self.shelf_found:
+                self.safe_gui_update(self.progress_table.update_shelf_data, msg)
             
         except Exception as e:
             pass
@@ -747,6 +771,10 @@ class WarehouseExplore(Node):
         except Exception as e:
             self.get_logger().error(f'Error in shelf detection: {str(e)}')
             return False
+        
+    def timer_callback(self):
+        if self.navigation_completed and not self.shelf_found:
+            self.start_forward_movement()
     
     
 
