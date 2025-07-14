@@ -12,7 +12,7 @@ import math
 import signal
 import sys
 
-from sensor_msgs.msg import Joy, CompressedImage
+from sensor_msgs.msg import Joy, CompressedImage, LaserScan
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist, PoseStamped
 from synapse_msgs.msg import Status, WarehouseShelf
 
@@ -201,6 +201,9 @@ class WarehouseExplore(Node):
     def __init__(self):
         super().__init__('warehouse_explore')
         self.current_goal_handle = None
+        self.qr_facing = False
+        self.obj_facing = False
+        self.stop_detection = False
         self.shelf_found = False
         self.node_shutdown = False
         self.declare_parameter('shelf_count', 1)
@@ -262,6 +265,12 @@ class WarehouseExplore(Node):
             self.camera_image_callback,
             QOS_PROFILE_DEFAULT)
 
+        self.subscription_lidar = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.lidar_callback,
+            QOS_PROFILE_DEFAULT)
+
         # Publishers
         self.publisher_joy = self.create_publisher(
             Joy,
@@ -296,7 +305,14 @@ class WarehouseExplore(Node):
         self.buggy_pose_x = 0.0
         self.buggy_pose_y = 0.0
         self.current_yaw = 0.0
+
+        # Lidar data variables
+        self.lidar_front_average = 0.0
+        self.lidar_data_received = False
         
+        # Heuristic angle variables
+        self.heuristic_angle_deg = 0.0
+        self.heuristic_angle_rad = 0.0
 
     def init_gui(self):
         """Initialize GUI in a separate thread"""
@@ -314,6 +330,8 @@ class WarehouseExplore(Node):
             
         self.gui_thread = Thread(target=gui_thread_func, daemon=False)  # Not daemon so it stays alive
         self.gui_thread.start()
+    
+    
     
     def safe_gui_update(self, func, *args):
         """Thread-safe GUI update method"""
@@ -352,10 +370,28 @@ class WarehouseExplore(Node):
                 self.publisher_joy.publish(disarm_msg)
                 
             self.get_logger().info("EMERGENCY STOP EXECUTED - Robot stopped immediately")
-            
+            sleep(2.0)
+            self.move_to_other_side()
         except Exception as e:
             self.get_logger().error(f"Error in emergency_stop_robot: {e}")
         sleep(0.1)
+        
+    def move_to_other_side(self):
+        """Move to the other side of the shelf"""
+        if self.obj_facing:
+            self.get_logger().info("Moving to other side of shelf to face QR code")
+            target_x = self.buggy_pose_x + (self.lidar_front_average + 0.32) * math.cos(self.target_angle_rad + 0.0175) - 1.9 * math.sin(self.target_angle_rad + 0.0175)
+            target_y = self.buggy_pose_y + (self.lidar_front_average + 0.32)* math.sin(self.target_angle_rad + 0.0175) + 1.9 * math.cos(self.target_angle_rad + 0.0175)
+            self.navigate_to_pose(target_x, target_y, self.target_angle_rad - math.pi/2)
+    
+        elif self.qr_detected:
+            self.get_logger().info("Moving to other side of shelf to face objects")
+            target_x = self.buggy_pose_x + (self.lidar_front_average + 0.6) * math.cos(self.target_angle_rad - 0.0175) + 2.75 * math.sin(self.target_angle_rad - 0.0175)
+            target_y = self.buggy_pose_y + (self.lidar_front_average + 0.6) * math.sin(self.target_angle_rad - 0.0175) - 2.75 * math.cos(self.target_angle_rad - 0.0175)
+            self.navigate_to_pose(target_x, target_y, self.target_angle_rad + math.pi/2)
+            
+        
+        
     def cancel_done_callback(self, future):
         try:
             response = future.result()
@@ -381,10 +417,13 @@ class WarehouseExplore(Node):
             qr_detector = cv2.QRCodeDetector()
             decoded_text, points, _ = qr_detector.detectAndDecode(image)
             
+            
+            
             if decoded_text and decoded_text != self.qr_code_str:
                 
                 self.qr_code_str = decoded_text
                 self.qr_detected = True
+                self.qr_facing = True
                 
                 # Store QR data
                 self.pending_shelf_data = WarehouseShelf()
@@ -393,21 +432,81 @@ class WarehouseExplore(Node):
                 
                 self.get_logger().info(f"QR DETECTED! EMERGENCY STOP TRIGGERED. QR: {decoded_text}")
                 self.emergency_stop_robot()
+                self.get_logger().info(self.get_front_lidar_distance())
+                
+                
+                
                 return
             # Shelf detection - only if not already found
-            if not self.shelf_found:
-                shelf_detected = self.detect_shelf(image)
-                if shelf_detected:
-                    self.shelf_found = True
-                    self.get_logger().info("SHELF DETECTED! EMERGENCY STOP TRIGGERED.")
-                    self.emergency_stop_robot() 
-                    return
+            
+            shelf_detected = self.detect_shelf(image)
+            if shelf_detected:
+                self.shelf_found = True
+                self.get_logger().info("SHELF DETECTED! EMERGENCY STOP TRIGGERED.")
+                self.get_logger().info(self.get_front_lidar_distance())
+                self.emergency_stop_robot() 
+                return
                     
                     
             # Set shelf_found flag after any detection
             
         except Exception as e:
             self.get_logger().error(f"Error in camera_image_callback: {e}")
+
+    def lidar_callback(self, msg):
+        """Process lidar data and calculate average of -1, 0, 1 degree readings"""
+        if self.node_shutdown:
+            return
+            
+        try:
+            # Get lidar parameters
+            angle_min = msg.angle_min
+            angle_max = msg.angle_max
+            angle_increment = msg.angle_increment
+            ranges = msg.ranges
+            
+            # Convert target angles to radians
+            target_angles = [-1.0, 0.0, 1.0]  # degrees
+            target_angles_rad = [math.radians(angle) for angle in target_angles]
+            
+            valid_readings = []
+            
+            for target_angle in target_angles_rad:
+                # Find the closest index for this angle
+                if angle_min <= target_angle <= angle_max:
+                    index = int((target_angle - angle_min) / angle_increment)
+                    
+                    # Ensure index is within bounds
+                    if 0 <= index < len(ranges):
+                        distance = ranges[index]
+                        
+                        # Check if reading is valid (not inf or nan)
+                        if not math.isinf(distance) and not math.isnan(distance) and distance > 0:
+                            valid_readings.append(distance)
+            
+            # Calculate average of valid readings
+            if valid_readings:
+                self.lidar_front_average = sum(valid_readings) / len(valid_readings)
+                self.lidar_data_received = True
+                
+                # Log the average distance (rate limited)
+                current_time = self.get_clock().now()
+                if not hasattr(self, 'last_lidar_log_time') or \
+                   (current_time - self.last_lidar_log_time).nanoseconds > 1_000_000_000:  # 1 second
+                    self.last_lidar_log_time = current_time
+                    self.get_logger().info(f"Front lidar average (-1,0,1 deg): {self.lidar_front_average:.3f}m")
+            else:
+                self.get_logger().warn("No valid lidar readings for front angles")
+                
+        except Exception as e:
+            self.get_logger().error(f"Error in lidar_callback: {e}")
+
+    def get_front_lidar_distance(self):
+        """Get the current front lidar average distance"""
+        if self.lidar_data_received:
+            return self.lidar_front_average
+        else:
+            return None
 
     def initial_navigation(self):
         try:
@@ -458,7 +557,7 @@ class WarehouseExplore(Node):
 
     def navigate_to_pose(self, x, y, yaw):
         """Navigate to a specific pose"""
-        if self.shelf_found or self.navigation_active or self.node_shutdown:
+        if  self.navigation_active or self.node_shutdown:
             return False
         
         self.navigation_active = True
@@ -623,6 +722,7 @@ class WarehouseExplore(Node):
             # Use thread-safe update
             if self.shelf_found:
                 # Always update the GUI table with new object data first
+                self.obj_facing = True
                 self.safe_gui_update(self.progress_table.update_shelf_objects, msg.object_name, msg.object_count)
                 
                 # Check if we have pending QR data and enough objects
@@ -693,9 +793,45 @@ class WarehouseExplore(Node):
                 
                 if (self.shelf_aspect_ratio_range[0] < aspect_ratio < self.shelf_aspect_ratio_range[1] and
                     solidity > self.shelf_solidity_threshold):
+                    # Only calculate and log angle when shelf is detected
+                    max_length = 0
+                    angle_deg = 0
+                    for i in range(4):
+                        pt1 = approx[i][0]
+                        pt2 = approx[(i+1)%4][0]
+                        dx = pt2[0] - pt1[0]
+                        dy = pt2[1] - pt1[1]
+                        length = math.hypot(dx, dy)
+                        if length > max_length:
+                            max_length = length
+                            angle_rad = math.atan2(dy, dx)
+                            angle_deg = math.degrees(angle_rad)
+                    self.get_logger().info(f"Shelf detected. Longest side angle: {angle_deg:.2f} degrees")
                     return True
         
         return False
+
+    def extract_heuristic_angle(self, heuristic_string):
+        """Extract the angle from the heuristic string"""
+        try:
+            # Extract 5-character string starting from 2nd index (index 1)
+            angle_str = heuristic_string[1:6]
+            angle_degrees = float(angle_str)
+            
+            # Store the angle in degrees
+            self.heuristic_angle_deg = angle_degrees
+            
+            # Convert to radians for calculations
+            self.heuristic_angle_rad = math.radians(angle_degrees)
+            
+            self.get_logger().info(f"Extracted heuristic angle: {angle_degrees}° ({self.heuristic_angle_rad:.4f} rad)")
+            print(f"Heuristic angle: {angle_degrees}°")
+            
+            return angle_degrees
+            
+        except Exception as e:
+            self.get_logger().error(f"Error extracting heuristic angle: {e}")
+            return None
 
     def destroy_node(self):
         """Clean shutdown of the node"""
