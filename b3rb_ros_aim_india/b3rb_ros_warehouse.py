@@ -200,6 +200,7 @@ class WindowProgressTable:
 class WarehouseExplore(Node):
     def __init__(self):
         super().__init__('warehouse_explore')
+        self.current_goal_handle = None
         self.shelf_found = False
         self.node_shutdown = False
         self.declare_parameter('shelf_count', 1)
@@ -324,39 +325,103 @@ class WarehouseExplore(Node):
         else:
             self.gui_queue.append((func, args))
 
-    def stop_robot_immediately(self):
-        """Stop all robot movement immediately"""
+    def emergency_stop_robot(self):
         try:
-            # Cancel any ongoing navigation
-            if hasattr(self, '_get_result_future') and self._get_result_future:
-                self._get_result_future.cancel()
+            if self.current_goal_handle is not None:
+                future = self.current_goal_handle.cancel_goal_async()
+                future.add_done_callback(self.cancel_done_callback)
+                self.get_logger().info("Attemptng to CANCEL current navigation goal")
+            # Send immediate stop command (zero velocity)
+            stop_cmd = Twist()
+            stop_cmd.linear.x = 0.0
+            stop_cmd.linear.y = 0.0
+            stop_cmd.linear.z = 0.0
+            stop_cmd.angular.x = 0.0
+            stop_cmd.angular.y = 0.0
+            stop_cmd.angular.z = 0.0
             
-            # Send stop command multiple times to ensure it's received
-            for _ in range(5):
-                twist = Twist()
-                twist.linear.x = 0.0
-                twist.linear.y = 0.0
-                twist.linear.z = 0.0
-                twist.angular.x = 0.0
-                twist.angular.y = 0.0
-                twist.angular.z = 0.0
-                self.publisher_cmd_vel.publish(twist)
-                sleep(0.1)
-            
-            self.navigation_active = False
-            self.get_logger().info("Robot stopped - all movement commands sent")
+            # Publish multiple times to ensure it's received
+            for _ in range(10):
+                self.publisher_cmd_vel.publish(stop_cmd)
+                
+            # Also send disarm command if available
+            if hasattr(self, 'publisher_joy'):
+                disarm_msg = Joy()
+                disarm_msg.buttons = [0, 0, 0, 0, 0, 0, 0, 0]  # All buttons released
+                disarm_msg.axes = [0.0, 0.0, 0.0, 0.0]  # All axes neutral
+                self.publisher_joy.publish(disarm_msg)
+                
+            self.get_logger().info("EMERGENCY STOP EXECUTED - Robot stopped immediately")
             
         except Exception as e:
-            self.get_logger().error(f"Error stopping robot: {e}")
+            self.get_logger().error(f"Error in emergency_stop_robot: {e}")
+        sleep(0.1)
+    def cancel_done_callback(self, future):
+        try:
+            response = future.result()
+            if len(response.goals_canceling) > 0:
+                self.get_logger().info("Navigation goal successfully cancelled")
+            else:
+                self.get_logger().info("No navigation goal to cancel")
+        except Exception as e:
+            self.get_logger().error(f"Error in cancel_done_callback: {e}")
 
-    def initial_navigation(self):
-        """Start navigation by sending first goal"""
-        if not self.initial_position_set or self.shelf_found:
-            self.get_logger().warn("Initial position not set yet or shelf already found, waiting...")
+    def camera_image_callback(self, message):
+        if self.node_shutdown:
             return
             
-        self.get_logger().info("Starting step-by-step navigation in target direction")
-        self.send_next_navigation_goal()
+        try:
+            np_arr = np.frombuffer(message.data, np.uint8)
+            image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            
+            # Emergency stop flag
+            
+            
+            # QR code detection
+            qr_detector = cv2.QRCodeDetector()
+            decoded_text, points, _ = qr_detector.detectAndDecode(image)
+            
+            if decoded_text and decoded_text != self.qr_code_str:
+                
+                self.qr_code_str = decoded_text
+                self.qr_detected = True
+                
+                # Store QR data
+                self.pending_shelf_data = WarehouseShelf()
+                self.pending_shelf_data.qr_decoded = decoded_text
+                self.progress_table.shelf_qr_codes[self.progress_table.current_shelf_index] = decoded_text
+                
+                self.get_logger().info(f"QR DETECTED! EMERGENCY STOP TRIGGERED. QR: {decoded_text}")
+                self.emergency_stop_robot()
+                return
+            # Shelf detection - only if not already found
+            if not self.shelf_found:
+                shelf_detected = self.detect_shelf(image)
+                if shelf_detected:
+                    self.shelf_found = True
+                    self.get_logger().info("SHELF DETECTED! EMERGENCY STOP TRIGGERED.")
+                    self.emergency_stop_robot() 
+                    return
+                    
+                    
+            # Set shelf_found flag after any detection
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in camera_image_callback: {e}")
+
+    def initial_navigation(self):
+        try:
+            # Check if robot is armed before navigation
+            if not self.armed:
+                self.get_logger().info("Robot not armed. Waiting for arming before navigation.")
+                return
+                
+            # Send first navigation goal
+            self.send_next_navigation_goal()
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in initial_navigation: {e}")
+            self.emergency_stop_robot()
 
     def send_next_navigation_goal(self):
         """Send next navigation goal in the target direction"""
@@ -418,40 +483,46 @@ class WarehouseExplore(Node):
         return True
 
     def nav_response_callback(self, future):
-        """Handle the response from the NavigateToPose action server"""
-        if self.shelf_found or self.node_shutdown:
-            return
+        try:
+            self.current_goal_handle = future.result()
             
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error('Navigation goal rejected')
-            self.navigation_active = False
-            return
-        
-        self.get_logger().info('Navigation goal accepted')
-        self._get_result_future = goal_handle.get_result_async()
-        self._get_result_future.add_done_callback(self.nav_result_callback)
+            if not self.current_goal_handle.accepted:
+                self.get_logger().info('Navigation goal rejected')
+                self.emergency_stop_robot()
+                return
+                
+            self.get_logger().info('Navigation goal accepted')
+            
+            # Get the result
+            result_future = self.current_goal_handle.get_result_async()
+            result_future.add_done_callback(self.nav_result_callback)
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in nav_response_callback: {e}")
+            self.emergency_stop_robot()
 
     def nav_result_callback(self, future):
-        """Handle the result of the NavigateToPose action"""
-        self.navigation_active = False
-        
-        if self.shelf_found or self.node_shutdown:
-            return
+        try:
+            result = future.result().result
+            status = future.result().status
             
-        status = future.result().status
-        
-        if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info('Navigation goal succeeded')
-            # Only send next goal if shelf not found
-            if not self.shelf_found and not self.node_shutdown:
-                # Small delay before sending next goal to allow system to stabilize
-                self.create_timer(1.0, self.send_next_navigation_goal)
-        else:
-            self.get_logger().warning(f'Navigation failed with status {status}')
-            # Try again after a delay
-            if not self.shelf_found and not self.node_shutdown:
-                self.create_timer(2.0, self.send_next_navigation_goal)
+            self.navigation_active = False
+            
+            if status == GoalStatus.STATUS_SUCCEEDED:
+                self.get_logger().info('Navigation goal succeeded')
+                # Continue with next goal if no shelf found
+                if not self.shelf_found and not self.node_shutdown:
+                    self.send_next_navigation_goal()
+                else:
+                    self.get_logger().info('Navigation completed or shelf found')
+                    self.emergency_stop_robot()
+            else:
+                self.get_logger().info(f'Navigation goal failed with status: {status}')
+                self.emergency_stop_robot()
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in nav_result_callback: {e}")
+            self.emergency_stop_robot()
 
     def navigation_feedback_callback(self, feedback_msg):
         """Handle navigation feedback with rate limiting"""
@@ -525,45 +596,6 @@ class WarehouseExplore(Node):
             self.navigate_to_pose(target_x, target_y, self.target_angle_rad)
             
             self.get_logger().info(f"Initial position set: x={self.initial_x:.3f}, y={self.initial_y:.3f}")
-
-    def camera_image_callback(self, message):
-        if self.node_shutdown:
-            return
-            
-        try:
-            np_arr = np.frombuffer(message.data, np.uint8)
-            image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            
-            # QR code detection
-            qr_detector = cv2.QRCodeDetector()
-            decoded_text, points, _ = qr_detector.detectAndDecode(image)
-            
-            if decoded_text and decoded_text != self.qr_code_str:
-                self.qr_code_str = decoded_text
-                self.qr_detected = True
-                
-                # Store QR data but don't update GUI yet
-                self.pending_shelf_data = WarehouseShelf()
-                self.pending_shelf_data.qr_decoded = decoded_text
-                
-                self.progress_table.shelf_qr_codes[self.progress_table.current_shelf_index] = decoded_text
-                
-                # NO GUI UPDATE HERE - only log
-                self.get_logger().info(f"QR code stored: {decoded_text} - Waiting for 6 objects before showing in GUI")
-            
-            # Shelf detection - only if not already found
-            if not self.shelf_found:
-                shelf_detected = self.detect_shelf(image)
-                if shelf_detected or self.qr_detected:  
-                      
-                    self.stop_robot_immediately()
-                    self.get_logger().info("SHELF (OR QR) DETECTED! Stopping robot immediately.")
-                    self.shelf_found = True
-                    
-                    self.get_logger().info("Robot stopped. GUI will remain active for data collection.")
-            
-        except Exception as e:
-            self.get_logger().error(f"Error in camera_image_callback: {e}")
 
     def cerebri_status_callback(self, message):
         if self.node_shutdown:
@@ -671,7 +703,7 @@ class WarehouseExplore(Node):
         self.get_logger().info("Node shutting down...")
         
         # Stop robot one more time
-        self.stop_robot_immediately()
+        self.emergency_stop_robot()
         
         # Call parent destroy
         super().destroy_node()
