@@ -431,6 +431,8 @@ class WarehouseExplore(Node):
                 self.progress_table.shelf_qr_codes[self.progress_table.current_shelf_index] = decoded_text
                 
                 self.get_logger().info(f"QR DETECTED! EMERGENCY STOP TRIGGERED. QR: {decoded_text}")
+                self.extract_heuristic_angle(decoded_text)
+                self.get_logger().info(f"Angle of next shelf from current shelf : {self.heuristic_angle_deg} degrees")
                 self.emergency_stop_robot()
                 self.get_logger().info(self.get_front_lidar_distance())
                 
@@ -814,21 +816,26 @@ class WarehouseExplore(Node):
     def extract_heuristic_angle(self, heuristic_string):
         """Extract the angle from the heuristic string"""
         try:
-            # Extract 5-character string starting from 2nd index (index 1)
-            angle_str = heuristic_string[1:6]
-            angle_degrees = float(angle_str)
-            
-            # Store the angle in degrees
-            self.heuristic_angle_deg = angle_degrees
-            
-            # Convert to radians for calculations
-            self.heuristic_angle_rad = math.radians(angle_degrees)
-            
-            self.get_logger().info(f"Extracted heuristic angle: {angle_degrees}° ({self.heuristic_angle_rad:.4f} rad)")
-            print(f"Heuristic angle: {angle_degrees}°")
-            
-            return angle_degrees
-            
+            # Split by underscore and get the second part (index 1)
+            parts = heuristic_string.split('_')
+            if len(parts) >= 2:
+                angle_str = parts[1]  # "116.6" from "2_116.6_HKq3wvCg8DGyflz3oNIj8d"
+                angle_degrees = float(angle_str)
+                
+                # Store the angle in degrees
+                self.heuristic_angle_deg = angle_degrees
+                
+                # Convert to radians for calculations
+                self.heuristic_angle_rad = math.radians(angle_degrees)
+                
+                self.get_logger().info(f"Extracted heuristic angle: {angle_degrees}° ({self.heuristic_angle_rad:.4f} rad)")
+                print(f"Heuristic angle: {angle_degrees}°")
+                
+                return angle_degrees
+            else:
+                self.get_logger().error("Invalid heuristic string format")
+                return None
+                
         except Exception as e:
             self.get_logger().error(f"Error extracting heuristic angle: {e}")
             return None
