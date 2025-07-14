@@ -204,7 +204,7 @@ class WarehouseExplore(Node):
         self.node_shutdown = False
         self.declare_parameter('shelf_count', 1)
         self.shelf_count = self.get_parameter('shelf_count').get_parameter_value().integer_value
-        
+        self.qr_detected = False
         # Declare alignment parameters
         self.declare_parameter('initial_angle', 0.0)
         self.target_angle_deg = self.get_parameter('initial_angle').get_parameter_value().double_value - 1
@@ -540,29 +540,30 @@ class WarehouseExplore(Node):
             
             if decoded_text and decoded_text != self.qr_code_str:
                 self.qr_code_str = decoded_text
+                self.qr_detected = True
                 
-                shelf_data = WarehouseShelf()
-                shelf_data.qr_decoded = decoded_text
+                # Store QR data but don't update GUI yet
+                self.pending_shelf_data = WarehouseShelf()
+                self.pending_shelf_data.qr_decoded = decoded_text
                 
-                # Use thread-safe update
-                self.safe_gui_update(self.progress_table.update_shelf_data, shelf_data)
+                self.progress_table.shelf_qr_codes[self.progress_table.current_shelf_index] = decoded_text
                 
-                self.publisher_shelf_data.publish(shelf_data)
+                # NO GUI UPDATE HERE - only log
+                self.get_logger().info(f"QR code stored: {decoded_text} - Waiting for 6 objects before showing in GUI")
             
             # Shelf detection - only if not already found
             if not self.shelf_found:
                 shelf_detected = self.detect_shelf(image)
-                if shelf_detected:    
-                    self.get_logger().info("SHELF DETECTED! Stopping robot immediately.")
-                    self.shelf_found = True
-                    
-                    # Stop robot immediately
+                if shelf_detected or self.qr_detected:  
+                      
                     self.stop_robot_immediately()
+                    self.get_logger().info("SHELF (OR QR) DETECTED! Stopping robot immediately.")
+                    self.shelf_found = True
                     
                     self.get_logger().info("Robot stopped. GUI will remain active for data collection.")
             
         except Exception as e:
-            pass
+            self.get_logger().error(f"Error in camera_image_callback: {e}")
 
     def cerebri_status_callback(self, message):
         if self.node_shutdown:
@@ -589,11 +590,52 @@ class WarehouseExplore(Node):
             
             # Use thread-safe update
             if self.shelf_found:
-                self.safe_gui_update(self.progress_table.update_shelf_data, msg)
-            
-        except Exception as e:
-            pass
+                # Always update the GUI table with new object data first
+                self.safe_gui_update(self.progress_table.update_shelf_objects, msg.object_name, msg.object_count)
+                
+                # Check if we have pending QR data and enough objects
+                if hasattr(self, 'pending_shelf_data') and self.pending_shelf_data:
+                    # Count total objects in the GUI table dictionary for current shelf
+                    total_objects = 0
+                    if self.progress_table.current_shelf_index in self.progress_table.shelf_objects:
+                        total_objects = sum(self.progress_table.shelf_objects[self.progress_table.current_shelf_index].values())
+                    
+                    self.get_logger().info(f"Current shelf {self.progress_table.current_shelf_index + 1} has {total_objects} total objects")
+                    
+                    if total_objects >= 6:
+                        # Merge object data with stored QR data
+                        self.pending_shelf_data.object_name = msg.object_name
+                        self.pending_shelf_data.object_count = msg.object_count
+                        
+                        # NOW update GUI with QR code (only when publishing)
+                        self.safe_gui_update(self.progress_table.update_qr_display, self.progress_table.current_shelf_index)
+                        
+                        # Publish the complete shelf data
+                        self.publisher_shelf_data.publish(self.pending_shelf_data)
+                        self.get_logger().info(f"Published shelf data with QR: {self.pending_shelf_data.qr_decoded} and {total_objects} objects")
+                        
+                        # Unlock the next shelf in GUI
+                        if self.progress_table.current_shelf_index < self.shelf_count - 1:
+                            next_shelf = self.progress_table.current_shelf_index + 1
+                            self.safe_gui_update(self.progress_table.unlock_shelf, next_shelf)
+                            self.progress_table.current_shelf_index = next_shelf
+                        
+                        # Clear pending data after publishing
+                        self.pending_shelf_data = None
+                        
+                        # Move to next shelf exploration
+                        self.shelf_found = False
+                        self.qr_detected = False
+                        self.get_logger().info("Shelf exploration complete. Moving to next shelf.")
+                    else:
+                        self.get_logger().info(f"QR stored but hidden in GUI. Objects: {total_objects}/6")
+                else:
+                    # No pending QR data, objects are already updated in GUI above
+                    self.get_logger().info("Objects detected but no QR code stored yet")
         
+        except Exception as e:
+            self.get_logger().error(f"Error in shelf_objects_callback: {e}")
+
     def detect_shelf(self, image):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
